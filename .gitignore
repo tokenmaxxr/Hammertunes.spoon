@@ -1,0 +1,8 @@
+# Generated docs (regenerate with hs.doc.builder.genJSON)
+docs.json
+
+# macOS
+.DS_Store
+
+# Runtime caches written to ~/.hammerspoon, never here — listed for safety
+.hammertunes-playlists.json

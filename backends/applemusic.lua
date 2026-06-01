@@ -1,0 +1,51 @@
+-- Hammertunes Apple Music backend — STUB / NOT YET IMPLEMENTED.
+--
+-- This file documents the backend interface and reserves the slot. It is not
+-- wired up yet: init.lua currently always loads backends/spotify.lua.
+--
+-- ----------------------------------------------------------------------------
+-- Backend interface (what pill.lua expects on `api`)
+-- ----------------------------------------------------------------------------
+-- Lifecycle:
+--   start(onChange)   -- begin background work; call onChange() when state changes
+--   stop()            -- tear down timers/watchers
+--   authenticate(id)  -- one-time auth (no-op for Apple Music, which uses
+--                        local AppleScript / MusicKit and needs no OAuth)
+--
+-- Now-playing context (read):
+--   getName()         -- current context display name (playlist/album), or nil
+--   getUri()          -- current context URI, or nil
+--   getLiked()        -- true/false/nil for the current track
+--   getSmartShuffle() -- true/false/nil (Spotify-specific; nil elsewhere)
+--   refresh()         -- re-poll context/smart-shuffle
+--   refreshLiked(id)  -- re-check liked state for a track id
+--
+-- Library / playback:
+--   getPlaylists()         -- cached list of { id, name, owned, imageUrl }
+--   refreshPlaylists(cb)
+--   getRecentlyPlayed()    -- cached list of { id, uri, name, imageUrl, playedAt }
+--   refreshRecentlyPlayed(cb)
+--   addToPlaylist(playlistId, trackId, cb)
+--   like(trackId) / unlike(trackId)
+--   playContext(uri, mode)        -- mode: "play" | "shuffle" | "smart"
+--   playLikedSongs(mode)
+--
+-- ----------------------------------------------------------------------------
+-- Remaining work to actually support Apple Music
+-- ----------------------------------------------------------------------------
+-- pill.lua is still Spotify-coupled in two spots that must move behind the
+-- backend before this stub can take over:
+--   1. State polling — pill.lua's fetchState() runs a hardcoded `tell
+--      application "Spotify"` AppleScript (SPOTIFY_QUERY). Apple Music needs the
+--      equivalent against `application "Music"`; lift state-fetch into the
+--      backend (e.g. api.getState() -> { running, playing, track, artist,
+--      progress, durMs, artUrl, trackId, shuffle }).
+--   2. Transport — pill.lua calls hs.spotify.{next,previous,playpause,play,
+--      getPosition,setPosition}. The Apple Music equivalent is hs.itunes.*
+--      (targets the Music app). Expose these as backend methods too.
+--
+-- Note: Apple Music has no Liked/Shuffle-smart/playlist Web API the way Spotify
+-- does; some menu items (smart shuffle, like-via-API) will be no-ops or use
+-- AppleScript equivalents (e.g. "loved" status, library playlists).
+
+error("Hammertunes: the Apple Music backend is not implemented yet")
