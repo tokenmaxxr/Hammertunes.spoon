@@ -29,11 +29,10 @@ obj.license = "MIT - https://opensource.org/licenses/MIT"
 -- file's own location so sibling files load no matter how the Spoon was loaded.
 obj.spoonPath = debug.getinfo(1, "S").source:sub(2):gsub("init%.lua$", "")
 
---- Hammertunes.hiddenContexts
---- Variable
---- List of Spotify context URIs that collapse the pill to a neutral "♪" (e.g.
---- playlists you'd rather not show in the menubar). Set before :start().
-obj.hiddenContexts = {}
+-- Optional power-user hook. If set to a function before :start(), the pill
+-- collapses to a neutral "♪" whenever hideContext(contextUri) returns truthy
+-- (e.g. to keep a particular playlist off the menubar). Off by default.
+obj.hideContext = nil
 
 obj._pill = nil
 obj._badge = nil
@@ -82,7 +81,7 @@ function obj:start()
   self._pill.start({
     badge = self._badge,
     api = backend(self),
-    hiddenContexts = self.hiddenContexts,
+    hideContext = self.hideContext,
   })
   return self
 end

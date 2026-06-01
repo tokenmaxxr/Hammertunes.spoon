@@ -54,13 +54,6 @@ hs.loadSpoon("Hammertunes")
 spoon.Hammertunes:start()
 ```
 
-### Optional: hide some contexts
-
-```lua
-spoon.Hammertunes.hiddenContexts = { "spotify:playlist:XXXX" }  -- pill shows ♪
-spoon.Hammertunes:start()
-```
-
 ## Requirements
 
 - macOS + Hammerspoon

@@ -29,9 +29,10 @@ local PILL_OPTS = {
   progressBg = { red = 0, green = 0, blue = 0, alpha = 0.7 },
 }
 
--- Context URIs that collapse the pill to "♪" (e.g. playlists you'd rather not
--- advertise in the menubar). Populated from config via module.start{ hiddenContexts = {...} }.
-local HIDDEN_CONTEXT_URIS = {}
+-- Optional power-user hook, set via module.start{ hideContext = fn }. If
+-- hideContext(uri) returns truthy, the pill collapses to a neutral "♪" for that
+-- context. Nil by default — most setups never need it.
+local hideContext = nil
 
 -- Tab-separated so song/artist names containing "|" don't break parsing.
 local SPOTIFY_QUERY = [[
@@ -104,10 +105,6 @@ local function truncate(s, max)
   if len <= max then return s end
   local cut = utf8.offset(s, max)
   return s:sub(1, cut - 1) .. "…"
-end
-
-local function isHiddenContext(uri)
-  return uri ~= nil and HIDDEN_CONTEXT_URIS[uri] == true
 end
 
 -- Modifier → playback mode for the right-click "Play" items.
@@ -279,7 +276,7 @@ render = function()
   prewarmMenuIcons()
   local ctxUri = api and api.getUri() or nil
   local ctxName = api and api.getName() or nil
-  if not s.running or isHiddenContext(ctxUri) then
+  if not s.running or (hideContext and hideContext(ctxUri)) then
     setBadge("♪")
     setTooltip("Spotify not running")
     return
@@ -532,7 +529,7 @@ module.start = function(deps)
   deps = deps or {}
   badge = deps.badge
   api = deps.api
-  for _, uri in ipairs(deps.hiddenContexts or {}) do HIDDEN_CONTEXT_URIS[uri] = true end
+  hideContext = deps.hideContext
   -- autosaveName lets macOS remember this pill's position (⌘-drag) across reloads.
   menu = hs.menubar.new(true, "hammertunes")
   if not menu then
