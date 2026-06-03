@@ -18,7 +18,9 @@ local RESTART_THRESHOLD_SEC = 3
 -- Without this, progress advances ~0.5% per tick and invalidates the cache every time.
 local PILL_PROGRESS_STEPS = 20
 -- Press-and-hold longer than this seeks to the mouse-relative position in the pill.
-local HOLD_THRESHOLD_SEC = 0.4
+-- Kept long enough that an ordinary click stays a clean play/pause and doesn't
+-- accidentally scrub the playhead.
+local HOLD_THRESHOLD_SEC = 1
 -- Minimum interval between scrub seeks while dragging. AppleScript setPosition calls
 -- are synchronous, so keep this loose enough to stay responsive without backing up.
 local SEEK_THROTTLE_SEC = 0.1
