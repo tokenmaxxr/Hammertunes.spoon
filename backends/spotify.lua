@@ -849,12 +849,76 @@ module.playLikedSongs = playLikedSongs
 module.getRecentlyPlayed = function() return recentlyPlayedCache end
 module.refreshRecentlyPlayed = fetchRecentlyPlayed
 
+-- ---------------------------------------------------------------------------
+-- Guided Web API setup (optional)
+-- ---------------------------------------------------------------------------
+-- Wraps authenticate() so the user never edits init.lua or hand-copies IDs.
+-- Reached from the right-click menu ("Enable Spotify extras…") and offered once
+-- on the first unauthenticated run. A per-user Spotify app is unavoidable
+-- (free dev-mode apps are capped at 25 manually-added users), so the wizard
+-- guides app creation rather than shipping a shared key.
+
+local OFFER_SETTING_KEY = "Hammertunes.spotifyExtrasOfferShown"
+
+-- True when the Web API has no usable credentials yet.
+local function needsSetup()
+  loadCreds()
+  return not (cachedClientId and cachedRefreshToken)
+end
+
+-- Consent -> Client ID -> approval. Each dialog is modal; cancelling any step
+-- (or an empty Client ID) aborts with no state change.
+local function setupWizard()
+  local choice = hs.dialog.blockAlert(
+    "Enable Spotify extras?",
+    "Adds playlists, like/unlike, Play Liked Songs, and the playing-from name " ..
+    "to the menu.\n\n" ..
+    "It's free. You create a Spotify API key with limited permissions (just " ..
+    "playback and your playlists/library) and approve it on Spotify's own " ..
+    "site, so the spoon never sees your password. Everything it stores - the " ..
+    "login and cached playlists - stays on your Mac.",
+    "Set it up", "Not now"
+  )
+  if choice ~= "Set it up" then return end
+
+  -- Pre-stage the redirect URI on the clipboard and open the dashboard so the
+  -- user can paste both pieces without leaving the flow.
+  hs.pasteboard.setContents(REDIRECT_URI)
+  hs.urlevent.openURL("https://developer.spotify.com/dashboard")
+
+  local btn, clientId = hs.dialog.textPrompt(
+    "Paste your Spotify Client ID",
+    "In the dashboard that just opened:\n" ..
+    "  1. Create app\n" ..
+    "  2. Set the Redirect URI to (already copied to your clipboard):\n" ..
+    "       " .. REDIRECT_URI .. "\n" ..
+    "  3. Copy the app's Client ID and paste it below.",
+    "", "Continue", "Cancel"
+  )
+  if btn ~= "Continue" then return end
+  clientId = clientId and clientId:gsub("%s+", "") or ""
+  if clientId == "" then
+    hs.alert.show("Spotify setup cancelled (no Client ID)")
+    return
+  end
+  module.authenticate(clientId)
+end
+
+module.needsSetup = needsSetup
+module.setup = setupWizard
+
 module.start = function(changeCallback)
   onChange = changeCallback
   loadCreds()
   loadPlaylistsCache()
   if not (cachedClientId and cachedRefreshToken) then
     log.i("not authenticated; skipping context fetch")
+    -- Offer the guided setup once, ever (deferred so the pill renders first).
+    -- The flag is set when shown, not on success, so declining doesn't re-prompt.
+    if not hs.settings.get(OFFER_SETTING_KEY) then
+      hs.settings.set(OFFER_SETTING_KEY, true)
+      hs.timer.doAfter(1.5, setupWizard)
+    end
     return
   end
   hs.timer.doAfter(0.5, refresh)
