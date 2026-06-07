@@ -2,9 +2,13 @@ LUA  ?= lua
 LUAC ?= luac
 SRC  := init.lua pill.lua badge.lua backends/spotify.lua backends/applemusic.lua
 
-.PHONY: all test check
+.PHONY: all test check update
 
 all: test
+
+# Pull the latest commit for this Spoon (fast-forward only).
+update:
+	@git pull --ff-only
 
 # Syntax-check every Lua source file.
 check:

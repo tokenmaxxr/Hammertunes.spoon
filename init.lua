@@ -34,10 +34,18 @@ obj.spoonPath = debug.getinfo(1, "S").source:sub(2):gsub("init%.lua$", "")
 -- (e.g. to keep a particular playlist off the menubar). Off by default.
 obj.hideContext = nil
 
+-- Optional opt-in update check. Set true before :start() to compare the
+-- checked-out Spoon against its git remote on launch; if behind, an "Update
+-- available" item appears in the right-click menu that pulls and reloads when
+-- clicked. Off by default - the Spoon never touches git unless you opt in, and
+-- never pulls without a click. See also `make update`.
+obj.checkForUpdates = false
+
 obj._pill = nil
 obj._badge = nil
 obj._backend = nil
 obj._backendName = "spotify"
+obj._updateAvailable = false
 
 -- hs.settings key for the user's persisted backend choice (written and read in
 -- separate methods, so it lives in one place).
@@ -55,6 +63,14 @@ end
 
 local function load(self, rel)
   return dofile(self.spoonPath .. rel)
+end
+
+-- Run a shell command asynchronously, calling back with (exitCode, stdout).
+-- hs.task starts from a minimal environment, so the usual Homebrew/system git
+-- locations are prepended to PATH.
+local function sh(cmd, cb)
+  local full = "export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:$PATH; " .. cmd
+  hs.task.new("/bin/sh", function(code, out) cb(code, out or "") end, { "-c", full }):start()
 end
 
 -- The backend is a stateful singleton; load it once and reuse so
@@ -106,6 +122,53 @@ function obj:switchBackend(name)
   return self
 end
 
+--- Hammertunes:checkUpdates([callback])
+--- Method
+--- Fetches the remote and checks whether the checked-out Spoon is behind it.
+--- Sets an internal flag that surfaces an "Update available" item in the
+--- right-click menu. Runs automatically on :start() when `checkForUpdates` is
+--- true; safe to call manually too. Network and git access are async, so this
+--- never blocks the menubar.
+---
+--- Parameters:
+---  * callback - optional function(updateAvailable, commitsBehind)
+---
+--- Returns:
+---  * The Hammertunes object
+function obj:checkUpdates(callback)
+  local p = self.spoonPath
+  local cmd = ("git -C '%s' fetch -q && git -C '%s' rev-list --count HEAD..@{u} 2>/dev/null")
+    :format(p, p)
+  sh(cmd, function(code, out)
+    local behind = tonumber((out:gsub("%s+", ""))) or 0
+    self._updateAvailable = (code == 0 and behind > 0)
+    if callback then callback(self._updateAvailable, behind) end
+  end)
+  return self
+end
+
+--- Hammertunes:update()
+--- Method
+--- Pulls the latest Spoon commit (fast-forward only) and reloads Hammerspoon on
+--- success. Backs the menu's "Update available" item.
+---
+--- Parameters:
+---  * None
+---
+--- Returns:
+---  * The Hammertunes object
+function obj:update()
+  sh(("git -C '%s' pull --ff-only -q"):format(self.spoonPath), function(code)
+    if code == 0 then
+      hs.alert.show("Hammertunes updated - reloading…")
+      hs.timer.doAfter(0.5, hs.reload)
+    else
+      hs.alert.show("Hammertunes update failed - pull manually")
+    end
+  end)
+  return self
+end
+
 --- Hammertunes:authenticate(clientId)
 --- Method
 --- One-time Spotify Web API setup. Opens a browser to approve access; the
@@ -153,7 +216,15 @@ function obj:start(opts)
     switchBackend = function()
       hs.timer.doAfter(0, function() self:switchBackend(other) end)
     end,
+    -- A getter (read fresh each menu open) plus a deferred action: :update()
+    -- reloads, tearing down the menu that invoked it, so defer past popupMenu.
+    updateAvailable = function() return self._updateAvailable end,
+    update = function() hs.timer.doAfter(0, function() self:update() end) end,
   })
+  -- Opt-in update check, deferred so it never delays the pill appearing.
+  if self.checkForUpdates then
+    hs.timer.doAfter(2, function() self:checkUpdates() end)
+  end
   return self
 end
 

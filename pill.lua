@@ -91,6 +91,8 @@ local api = nil
 -- drive the menu's "Switch to …" item. init owns all backend-identity logic.
 local switchLabel = nil
 local switchBackend = nil
+local updateAvailable = nil
+local updateNow = nil
 
 local function truncate(s, max)
   if not s then return "" end
@@ -492,6 +494,12 @@ local function showRightClickMenu()
     api.refreshPlaylists()
     api.refreshRecentlyPlayed()
   end
+  -- Update notice (opt-in via spoon.checkForUpdates): only when the checked-out
+  -- Spoon is behind its remote. Clicking pulls and reloads.
+  if updateAvailable and updateAvailable() then
+    items[#items + 1] = { title = "-" }
+    items[#items + 1] = { title = "Update available - install now", fn = function() if updateNow then updateNow() end end }
+  end
   -- Account / backend group: a single separator, then setup-or-reauth and the
   -- backend switch together (no divider between them).
   local showSetup = api and api.needsSetup and api.needsSetup()
@@ -548,6 +556,8 @@ module.start = function(deps)
   hideContext = deps.hideContext
   switchLabel = deps.switchLabel
   switchBackend = deps.switchBackend
+  updateAvailable = deps.updateAvailable
+  updateNow = deps.update
   -- autosaveName lets macOS remember this pill's position (⌘-drag) across reloads.
   menu = hs.menubar.new(true, "hammertunes")
   if not menu then

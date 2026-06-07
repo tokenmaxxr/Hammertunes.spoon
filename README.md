@@ -56,7 +56,10 @@ git clone https://github.com/tokenmaxxr/Hammertunes.spoon \
   ~/.hammerspoon/Spoons/Hammertunes.spoon
 ```
 
-Update later with `git -C ~/.hammerspoon/Spoons/Hammertunes.spoon pull`.
+Update later with `git -C ~/.hammerspoon/Spoons/Hammertunes.spoon pull` (or
+`make -C ~/.hammerspoon/Spoons/Hammertunes.spoon update`). To be notified in the
+right-click menu when an update is available, set
+`spoon.Hammertunes.checkForUpdates = true` before `:start()`.
 
 ### 2. Add to your `~/.hammerspoon/init.lua`
 
@@ -132,7 +135,10 @@ git clone https://github.com/tokenmaxxr/Hammertunes.spoon \
   ~/.hammerspoon/Spoons/Hammertunes.spoon
 ```
 
-Update later with `git -C ~/.hammerspoon/Spoons/Hammertunes.spoon pull`.
+Update later with `git -C ~/.hammerspoon/Spoons/Hammertunes.spoon pull` (or
+`make -C ~/.hammerspoon/Spoons/Hammertunes.spoon update`). To be notified in the
+right-click menu when an update is available, set
+`spoon.Hammertunes.checkForUpdates = true` before `:start()`.
 
 ### 2. Add to your `~/.hammerspoon/init.lua`
 
