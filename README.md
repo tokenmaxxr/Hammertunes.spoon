@@ -211,6 +211,16 @@ so you can leave your config as-is and toggle from the menu whenever you like.
 
 ## Development
 
+For hacking on the Spoon itself, clone to a directory **without** the `.spoon`
+extension and symlink it into place - Hammerspoon claims the `.spoon` extension,
+so double-clicking a `.spoon` folder in Finder "installs" it by moving it into
+`~/.hammerspoon/Spoons/` (taking your checkout with it):
+
+```sh
+git clone https://github.com/tokenmaxxr/Hammertunes.spoon ~/git/Hammertunes
+ln -s ~/git/Hammertunes ~/.hammerspoon/Spoons/Hammertunes.spoon
+```
+
 Pure logic (state parsing, progress math, AppleScript escaping) has a small
 unit-test suite that runs without Hammerspoon:
 
