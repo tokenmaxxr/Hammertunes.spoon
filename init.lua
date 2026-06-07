@@ -41,8 +41,8 @@ obj.hideContext = nil
 -- disable the check entirely. See also `make update`.
 obj.checkForUpdates = true
 
+obj._menubar = nil
 obj._pill = nil
-obj._badge = nil
 obj._backend = nil
 obj._backendName = "spotify"
 obj._updateAvailable = false
@@ -198,18 +198,18 @@ end
 --- Returns:
 ---  * The Hammertunes object
 function obj:start(opts)
-  if self._pill then return self end
+  if self._menubar then return self end
   -- A persisted choice from :switchBackend wins over config-time selection.
   local choice = hs.settings.get(BACKEND_SETTING_KEY) or (opts and opts.backend)
   if choice then self:setBackend(choice) end
-  self._badge = load(self, "badge.lua")
   self._pill = load(self, "pill.lua")
-  -- Hand pill a ready display label and an opaque toggle. The toggle defers
-  -- itself because it tears down the very pill/menu that invokes it, so pill
-  -- doesn't need to know that.
+  self._menubar = load(self, "menubar.lua")
+  -- Hand menubar a ready display label and an opaque toggle. The toggle defers
+  -- itself because it tears down the very menubar item/menu that invokes it, so
+  -- menubar doesn't need to know that.
   local other = otherBackend(self._backendName)
-  self._pill.start({
-    badge = self._badge,
+  self._menubar.start({
+    pill = self._pill,
     api = backend(self),
     hideContext = self.hideContext,
     switchLabel = DISPLAY_NAMES[other],
@@ -238,8 +238,8 @@ end
 --- Returns:
 ---  * The Hammertunes object
 function obj:stop()
-  if self._pill then self._pill.stop() end
-  self._pill = nil
+  if self._menubar then self._menubar.stop() end
+  self._menubar = nil
   return self
 end
 

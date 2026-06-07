@@ -11,6 +11,6 @@ local t = require("helper")
 require("spotify_spec")
 require("applemusic_spec")
 require("init_spec")
-require("pill_spec")
+require("menubar_spec")
 
 os.exit(t.report())
