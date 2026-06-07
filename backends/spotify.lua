@@ -286,10 +286,11 @@ local function refresh()
   end)
 end
 
--- Liked-state for a single track. Cache is just the current track — Spotify
--- can be liked/unliked from any client, but re-checking on every track switch
--- keeps the badge fresh enough without polling.
-local function refreshLiked(trackId)
+-- Liked-state for a single track. Cached per current track; pill.lua re-checks
+-- on every track switch and (via the `force` arg) polls periodically during
+-- playback so likes made in the Spotify app are reflected. Pass force=true to
+-- bypass the cache and re-fetch.
+local function refreshLiked(trackId, force)
   if not trackId then
     if currentTrackId ~= nil or currentLiked ~= nil then
       currentTrackId, currentLiked = nil, nil
@@ -297,7 +298,7 @@ local function refreshLiked(trackId)
     end
     return
   end
-  if trackId == currentTrackId and currentLiked ~= nil then return end
+  if not force and trackId == currentTrackId and currentLiked ~= nil then return end
   currentTrackId = trackId
   ensureAccessToken(function(token)
     if not token then
@@ -826,6 +827,10 @@ module.supportsSmartShuffle = true
 module.supportsReauth = true
 -- Accent for the "liked" heart on the pill (a Spotify-ish green).
 module.likedColor = { red = 0.07, green = 0.5, blue = 0.24 }
+-- How often (seconds) pill.lua should re-poll the current track's liked state
+-- during playback, so a like made in the Spotify app shows up without waiting
+-- for a track change. Spotify only (Apple Music reads favorited every tick).
+module.likedPollSeconds = 15
 
 -- Pure helpers exposed for unit tests (see tests/). Not part of the backend
 -- interface pill.lua depends on.
