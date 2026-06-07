@@ -6,38 +6,16 @@ local verify = iface.verify
 -- Helpers
 -- ---------------------------------------------------------------------------
 
--- Build a fully-compliant stub backend so individual tests can nil out one
--- member at a time and confirm the verifier catches exactly that member.
+-- Build a fully-compliant stub backend, derived from the exported REQUIRED
+-- spec so it never drifts, letting individual tests nil out one member at a
+-- time and confirm the verifier catches exactly that member.
 local function fullStub()
   local noop = function() end
-  return {
-    appName               = "TestApp",
-    getState              = noop,
-    start                 = noop,
-    stop                  = noop,
-    refresh               = noop,
-    refreshLiked          = noop,
-    getLiked              = noop,
-    like                  = noop,
-    unlike                = noop,
-    getPlaylists          = noop,
-    refreshPlaylists      = noop,
-    getRecentlyPlayed     = noop,
-    refreshRecentlyPlayed = noop,
-    addToPlaylist         = noop,
-    playContext           = noop,
-    getName               = noop,
-    getUri                = noop,
-    getSmartShuffle       = noop,
-    setShuffling          = noop,
-    getPosition           = noop,
-    setPosition           = noop,
-    previous              = noop,
-    next                  = noop,
-    playpause             = noop,
-    play                  = noop,
-    authenticate          = noop,
-  }
+  local stub = {}
+  for member, expectedType in pairs(iface.REQUIRED) do
+    stub[member] = expectedType == "string" and "TestApp" or noop
+  end
+  return stub
 end
 
 -- ---------------------------------------------------------------------------
@@ -100,4 +78,18 @@ t.test("interface: full stub passes verification", function()
   local stub = fullStub()
   local result = verify(stub, "backends/stub.lua")
   t.ok(result == stub, "verify should return the backend itself")
+end)
+
+-- ---------------------------------------------------------------------------
+-- REQUIRED spec and LuaCATS annotations stay in sync
+-- ---------------------------------------------------------------------------
+
+t.test("interface: every REQUIRED member has a ---@field annotation", function()
+  local f = assert(io.open(t.ROOT .. "backends/interface.lua"))
+  local source = f:read("a")
+  f:close()
+  for member in pairs(iface.REQUIRED) do
+    t.ok(source:find("---@field " .. member .. " ", 1, true),
+      "missing ---@field annotation for required member " .. member)
+  end
 end)

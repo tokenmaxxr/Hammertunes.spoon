@@ -79,6 +79,8 @@ local module = {}
 -- ---------------------------------------------------------------------------
 
 -- Every member that every backend MUST provide, with its expected Lua type.
+-- Keep in sync with the ---@field block above; tests assert each key here has
+-- a matching @field annotation. Exported so tests derive stubs from it.
 local REQUIRED = {
   appName              = "string",
   getState             = "function",
@@ -127,5 +129,7 @@ function module.verify(backend, name)
   end
   return backend
 end
+
+module.REQUIRED = REQUIRED
 
 return module
