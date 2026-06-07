@@ -46,6 +46,7 @@ local lastTrack = nil
 local lastArtist = nil
 local lastTrackId = nil
 local lastDurMs = 0
+local lastLikedPoll = 0
 local holdTimer = nil
 local holdFired = false
 local lastSeekTime = 0
@@ -241,6 +242,15 @@ render = function()
   end
   if api and s.trackId ~= lastTrackId then
     api.refreshLiked(s.trackId)
+    lastLikedPoll = hs.timer.secondsSinceEpoch()
+  elseif api and s.trackId and api.likedPollSeconds then
+    -- Same track still playing: re-poll liked state every api.likedPollSeconds
+    -- so a like made in the player's own app shows up without a track change.
+    local now = hs.timer.secondsSinceEpoch()
+    if now - lastLikedPoll >= api.likedPollSeconds then
+      lastLikedPoll = now
+      api.refreshLiked(s.trackId, true)
+    end
   end
   lastTrack = s.track
   lastArtist = s.artist
@@ -590,7 +600,7 @@ module.stop = function()
   if api then api.stop() end
   timer, pendingClick, mouseDownWatcher, menu, pill = nil, nil, nil, nil, nil
   lastTooltip, lastTrack, lastArtist, lastTrackId = nil, nil, nil, nil
-  lastDurMs, holdFired, lastSeekTime, lastPlaying = 0, false, 0, false
+  lastDurMs, holdFired, lastSeekTime, lastPlaying, lastLikedPoll = 0, false, 0, false, 0
   lastShuffle, lastRunning = false, false
   artCache, artFetching, artCacheCount = {}, {}, 0
   menuIconCache, menuIconFetching, menuIconCacheCount = {}, {}, 0
