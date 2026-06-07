@@ -1,6 +1,6 @@
 LUA  ?= lua
 LUAC ?= luac
-SRC  := init.lua menubar.lua pill.lua rightclick.lua images.lua backends/spotify.lua backends/applemusic.lua
+SRC  := init.lua menubar.lua pill.lua rightclick.lua images.lua backends/interface.lua backends/spotify.lua backends/applemusic.lua
 
 .PHONY: all test check update
 

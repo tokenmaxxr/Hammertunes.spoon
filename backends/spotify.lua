@@ -12,6 +12,7 @@
 --      Browser opens, you approve, done. The Client ID is also saved to the
 --      Keychain so later re-auths can be called as :authenticate().
 
+---@type HammertunesBackend
 local module = {}
 local log = hs.logger.new("hammertunes.spotify", "info")
 

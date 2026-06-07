@@ -8,6 +8,7 @@
 -- touching track metadata. Shuffle, like/unlike, and playlists go through
 -- AppleScript. No OAuth is required.
 
+---@type HammertunesBackend
 local module = {}
 local log = hs.logger.new("hammertunes.applemusic", "info")
 

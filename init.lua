@@ -76,9 +76,17 @@ end
 -- The backend is a stateful singleton; load it once and reuse so
 -- :authenticate() and :start() share the same token/cache state. The
 -- concrete backend (Spotify / Apple Music) is chosen via :setBackend().
+-- The interface module is loaded once and its verifier runs on every fresh
+-- backend load so contract violations surface immediately at startup.
+local _interface = nil
 local function backend(self)
   if not self._backend then
-    self._backend = load(self, "backends/" .. self._backendName .. ".lua")
+    if not _interface then
+      _interface = load(self, "backends/interface.lua")
+    end
+    local b = load(self, "backends/" .. self._backendName .. ".lua")
+    _interface.verify(b, "backends/" .. self._backendName .. ".lua")
+    self._backend = b
   end
   return self._backend
 end

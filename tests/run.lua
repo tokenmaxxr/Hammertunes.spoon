@@ -10,6 +10,7 @@ local t = require("helper")
 
 require("spotify_spec")
 require("applemusic_spec")
+require("interface_spec")
 require("init_spec")
 require("menubar_spec")
 require("rightclick_spec")
