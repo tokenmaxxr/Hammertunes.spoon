@@ -424,6 +424,7 @@ local function fetchPlaylists(callback)
                   name = p.name,
                   owned = p.owner.id == uid,
                   imageUrl = p.images and p.images[1] and p.images[1].url or nil,
+                  uri = "spotify:playlist:" .. p.id,
                 })
               end
             end
@@ -752,6 +753,83 @@ local function setLiked(trackId, liked, verb)
     )
   end)
 end
+
+-- Tab-separated so song/artist names containing "|" don't break parsing.
+local SPOTIFY_QUERY = [[
+if application "Spotify" is running then
+  tell application "Spotify"
+    set s to player state as text
+    set sh to shuffling as text
+    try
+      return s & tab & (name of current track) & tab & (artist of current track) & tab & (player position) & tab & (duration of current track) & tab & (artwork url of current track) & tab & (id of current track) & tab & sh
+    on error
+      return s & tab & tab & tab & "0" & tab & "0" & tab & tab & sh
+    end try
+  end tell
+else
+  return ""
+end if
+]]
+
+-- Parse a non-empty SPOTIFY_QUERY result line into the backend state table.
+-- Pure (no hs.*), so it's unit-testable in isolation.
+local function parseSpotifyState(result)
+  local state, track, artist, pos, dur, artUrl, trackUri, shuffle =
+    result:match("^([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t(.*)$")
+  local posSec = tonumber(pos) or 0
+  local durMs = tonumber(dur) or 0
+  local progress = 0
+  if durMs > 0 then
+    progress = math.max(0, math.min(1, posSec / (durMs / 1000)))
+  end
+  -- Bare ID only — Web API endpoints (/v1/me/tracks*) want the ID, not the URI.
+  -- Local files come through as "spotify:local:..." which the API rejects, so
+  -- limit to real track IDs.
+  local trackId = trackUri and trackUri:match("^spotify:track:(.+)$") or nil
+  return {
+    running = true,
+    playing = state == "playing",
+    track = track ~= "" and track or nil,
+    artist = artist ~= "" and artist or nil,
+    progress = progress,
+    durMs = durMs,
+    artUrl = artUrl ~= "" and artUrl or nil,
+    artPath = nil,
+    trackId = trackId,
+    shuffle = shuffle == "true",
+  }
+end
+
+module.getState = function()
+  local ok, result = hs.osascript.applescript(SPOTIFY_QUERY)
+  if not ok or type(result) ~= "string" or result == "" then
+    return { running = false }
+  end
+  return parseSpotifyState(result)
+end
+
+module.next = function() hs.spotify.next() end
+module.previous = function() hs.spotify.previous() end
+module.playpause = function() hs.spotify.playpause() end
+module.play = function() hs.spotify.play() end
+module.getPosition = function() return hs.spotify.getPosition() end
+module.setPosition = function(sec) hs.spotify.setPosition(sec) end
+-- AppleScript toggles shuffle on the local app synchronously and without Web API
+-- auth. It can't exit Spotify's real Smart Shuffle (a platform limitation), which
+-- the menu reflects by showing Smart Shuffle as read-only.
+module.setShuffling = function(on)
+  hs.osascript.applescript('tell application "Spotify" to set shuffling to ' .. tostring(on))
+end
+
+module.appName = "Spotify"
+module.supportsSmartShuffle = true
+module.supportsReauth = true
+-- Accent for the "liked" heart on the pill (a Spotify-ish green).
+module.likedColor = { red = 0.07, green = 0.5, blue = 0.24 }
+
+-- Pure helpers exposed for unit tests (see tests/). Not part of the backend
+-- interface pill.lua depends on.
+module._test = { parseSpotifyState = parseSpotifyState }
 
 module.getName = function() return currentName end
 module.getUri = function() return currentUri end

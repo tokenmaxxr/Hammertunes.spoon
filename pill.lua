@@ -21,8 +21,9 @@ local PILL_PROGRESS_STEPS = 20
 -- Kept long enough that an ordinary click stays a clean play/pause and doesn't
 -- accidentally scrub the playhead.
 local HOLD_THRESHOLD_SEC = 1
--- Minimum interval between scrub seeks while dragging. AppleScript setPosition calls
--- are synchronous, so keep this loose enough to stay responsive without backing up.
+-- Minimum interval between scrub seeks while dragging. setPosition calls are
+-- synchronous in most backends, so keep this loose enough to stay responsive
+-- without backing up.
 local SEEK_THROTTLE_SEC = 0.1
 local PILL_OPTS = {
   radius = 6,
@@ -35,23 +36,6 @@ local PILL_OPTS = {
 -- hideContext(uri) returns truthy, the pill collapses to a neutral "♪" for that
 -- context. Nil by default — most setups never need it.
 local hideContext = nil
-
--- Tab-separated so song/artist names containing "|" don't break parsing.
-local SPOTIFY_QUERY = [[
-if application "Spotify" is running then
-  tell application "Spotify"
-    set s to player state as text
-    set sh to shuffling as text
-    try
-      return s & tab & (name of current track) & tab & (artist of current track) & tab & (player position) & tab & (duration of current track) & tab & (artwork url of current track) & tab & (id of current track) & tab & sh
-    on error
-      return s & tab & tab & tab & "0" & tab & "0" & tab & tab & sh
-    end try
-  end tell
-else
-  return ""
-end if
-]]
 
 local menu = nil
 local pill = nil
@@ -96,10 +80,16 @@ local menuIconCache = {}
 local menuIconCacheCount = 0
 local menuIconFetching = {}
 
--- Backend (Web API extras: context name, liked-state, playlists). Injected by
--- module.start. Currently always the Spotify backend; Apple Music will slot in
--- here once state/transport are abstracted behind the same interface.
+-- Backend (transport, state, Web API extras). Injected by module.start.
+-- Implements the shared api interface; both Spotify and Apple Music backends
+-- slot in here.
 local api = nil
+
+-- Display label of the OTHER backend (e.g. "Apple Music") and an opaque,
+-- self-deferring callback that swaps to it. Both injected by module.start; they
+-- drive the menu's "Switch to …" item. init owns all backend-identity logic.
+local switchLabel = nil
+local switchBackend = nil
 
 local function truncate(s, max)
   if not s then return "" end
@@ -117,60 +107,51 @@ local function playMode(mods)
   return "play"
 end
 
-local function fetchState()
-  local ok, result = hs.osascript.applescript(SPOTIFY_QUERY)
-  if not ok or type(result) ~= "string" or result == "" then
-    return { running = false }
-  end
-  local state, track, artist, pos, dur, artUrl, trackUri, shuffle =
-    result:match("^([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t(.*)$")
-  local posSec = tonumber(pos) or 0
-  local durMs = tonumber(dur) or 0
-  local progress = 0
-  if durMs > 0 then
-    progress = math.max(0, math.min(1, posSec / (durMs / 1000)))
-  end
-  -- Bare ID only — Web API endpoints (/v1/me/tracks*) want the ID, not the URI.
-  -- Local files come through as "spotify:local:..." which the API rejects, so
-  -- limit to real track IDs.
-  local trackId = trackUri and trackUri:match("^spotify:track:(.+)$") or nil
-  return {
-    running = true,
-    playing = state == "playing",
-    track = track ~= "" and track or nil,
-    artist = artist ~= "" and artist or nil,
-    progress = progress,
-    durMs = durMs,
-    artUrl = artUrl ~= "" and artUrl or nil,
-    trackId = trackId,
-    shuffle = shuffle == "true",
-  }
+local render
+-- ensureArt fetches or loads cover art and caches the resulting hs.image.
+-- Pass artUrl (http URL) for streaming art or artPath (local file path) for
+-- library tracks. Exactly one should be non-nil; both nil is a no-op.
+-- URL art is fetched asynchronously and triggers a render() on completion.
+-- Path art is loaded synchronously (the file is already local).
+-- Write an HTTP image body to a temp file and load it as an hs.image, or nil if
+-- the body is missing/unreadable. Shared by the cover-art and menu-icon fetches.
+local function bodyToImage(body)
+  if not body then return nil end
+  local path = os.tmpname()
+  local f = io.open(path, "wb")
+  if not f then return nil end
+  f:write(body)
+  f:close()
+  local img = hs.image.imageFromPath(path)
+  os.remove(path)
+  return img
 end
 
-local render
-local function ensureArt(url)
-  if not url then return nil end
-  local cached = artCache[url]
+local function ensureArt(artUrl, artPath)
+  local key = artUrl or artPath
+  if not key then return nil end
+  local cached = artCache[key]
   if cached ~= nil then return cached end
-  if artFetching[url] then return nil end
-  artFetching[url] = true
-  hs.http.asyncGet(url, nil, function(code, body)
-    artFetching[url] = nil
-    local img = nil
-    if code == 200 and body then
-      local path = os.tmpname()
-      local f = io.open(path, "wb")
-      if f then
-        f:write(body)
-        f:close()
-        img = hs.image.imageFromPath(path)
-        os.remove(path)
-      end
-    end
+  if artPath then
+    -- Local file: load synchronously, no async fetch needed.
+    local img = hs.image.imageFromPath(artPath) or false
     if artCacheCount >= MAX_ART_CACHE then
       artCache, artCacheCount = {}, 0
     end
-    artCache[url] = img or false
+    artCache[key] = img
+    artCacheCount = artCacheCount + 1
+    return img or nil
+  end
+  -- artUrl: async HTTP fetch.
+  if artFetching[key] then return nil end
+  artFetching[key] = true
+  hs.http.asyncGet(artUrl, nil, function(code, body)
+    artFetching[key] = nil
+    local img = (code == 200 and bodyToImage(body)) or nil
+    if artCacheCount >= MAX_ART_CACHE then
+      artCache, artCacheCount = {}, 0
+    end
+    artCache[key] = img or false
     artCacheCount = artCacheCount + 1
     if img and render then render() end
   end)
@@ -207,17 +188,7 @@ local function ensureMenuIcon(url)
   menuIconFetching[url] = true
   hs.http.asyncGet(url, nil, function(code, body)
     menuIconFetching[url] = nil
-    local img = nil
-    if code == 200 and body then
-      local path = os.tmpname()
-      local f = io.open(path, "wb")
-      if f then
-        f:write(body)
-        f:close()
-        img = hs.image.imageFromPath(path)
-        os.remove(path)
-      end
-    end
+    local img = (code == 200 and bodyToImage(body)) or nil
     if img then img = scaleToMenuIcon(img) end
     if menuIconCacheCount >= MAX_MENU_ICON_CACHE then
       menuIconCache, menuIconCacheCount = {}, 0
@@ -243,14 +214,17 @@ local function prewarmMenuIcons()
   end
 end
 
-local function setBadge(text, progress, subtitle, artUrl, liked)
-  local art = ensureArt(artUrl)
+local function setBadge(text, progress, subtitle, artUrl, artPath, liked)
+  local art = ensureArt(artUrl, artPath)
+  local artKey = artUrl or artPath
   pill.update(text, {
     progress = progress,
     subtitle = subtitle,
     leadingImage = art or nil,
-    leadingImageKey = art and artUrl or nil,
+    leadingImageKey = art and artKey or nil,
     likedOverlay = liked == true and art ~= nil,
+    -- Heart accent comes from the active backend (Spotify green / Apple Music red).
+    likedColor = api and api.likedColor or nil,
   })
 end
 
@@ -261,7 +235,7 @@ local function setTooltip(text)
 end
 
 render = function()
-  local s = fetchState()
+  local s = api and api.getState() or { running = false }
   if api and s.track and (s.track ~= lastTrack or (s.playing and not lastPlaying)) then
     api.refresh()
   end
@@ -280,7 +254,7 @@ render = function()
   local ctxName = api and api.getName() or nil
   if not s.running or (hideContext and hideContext(ctxUri)) then
     setBadge("♪")
-    setTooltip("Spotify not running")
+    setTooltip(api and (api.appName .. " not running") or "Not running")
     return
   end
   if s.track then
@@ -288,7 +262,7 @@ render = function()
     local main = icon .. "\u{2002}" .. truncate(s.track, MAX_TRACK)
     local subtitle = s.artist and truncate(s.artist, MAX_ARTIST) or nil
     local liked = api and api.getLiked() == true
-    setBadge(main, s.progress, subtitle, s.artUrl, liked)
+    setBadge(main, s.progress, subtitle, s.artUrl, s.artPath, liked)
   else
     setBadge("♪")
   end
@@ -298,7 +272,7 @@ render = function()
   if s.track then lines[#lines + 1] = PAD .. "🎵\u{2002}" .. s.track end
   if s.artist then lines[#lines + 1] = PAD .. "👤\u{2002}" .. s.artist end
   if ctxName then lines[#lines + 1] = PAD .. "💿\u{2002}" .. ctxName end
-  if #lines == 0 then setTooltip("Spotify") return end
+  if #lines == 0 then setTooltip(api and api.appName or "Player") return end
   setTooltip("\n" .. table.concat(lines, "\n\n") .. "\n")
 end
 
@@ -309,16 +283,14 @@ local function copyCurrent()
   hs.alert.show("📋 " .. text, {}, 2)
 end
 
--- Spotify's AppleScript state lags mutating commands; refresh shortly after they fire.
+-- State lags mutating commands; refresh shortly after they fire.
 local function scheduleRender()
   hs.timer.doAfter(0.2, render)
 end
 
--- AppleScript toggles shuffle on the local app synchronously and without Web API
--- auth. It can't exit Spotify's real Smart Shuffle (a platform limitation), which
--- the menu reflects by showing Smart Shuffle as read-only.
+-- Delegates shuffle toggling to the backend and schedules a re-render.
 local function setShuffling(on)
-  hs.osascript.applescript('tell application "Spotify" to set shuffling to ' .. tostring(on))
+  api.setShuffling(on)
   scheduleRender()
 end
 
@@ -341,24 +313,24 @@ local function seekToMouse()
   if not frame or frame.w <= 0 or lastDurMs <= 0 then return end
   local relX = hs.mouse.absolutePosition().x - frame.x
   local ratio = math.max(0, math.min(1, relX / frame.w))
-  hs.spotify.setPosition(ratio * (lastDurMs / 1000))
+  api.setPosition(ratio * (lastDurMs / 1000))
   lastSeekTime = hs.timer.secondsSinceEpoch()
 end
 
 local function onLeftClick()
   clearPending()
-  local pos = hs.spotify.getPosition() or 0
+  local pos = api.getPosition() or 0
   if pos > RESTART_THRESHOLD_SEC then
-    hs.spotify.setPosition(0)
+    api.setPosition(0)
   else
-    hs.spotify.previous()
+    api.previous()
   end
   scheduleRender()
 end
 
 local function onRightClick()
   clearPending()
-  hs.spotify.next()
+  api.next()
   scheduleRender()
 end
 
@@ -371,13 +343,13 @@ local function onMiddleClick()
   end
   pendingClick = hs.timer.doAfter(DOUBLE_CLICK_SEC, function()
     pendingClick = nil
-    hs.spotify.playpause()
+    api.playpause()
     scheduleRender()
   end)
 end
 
 -- Current shuffle mode for the right-click menu. Regular on/off comes from the
--- 1Hz AppleScript poll (lastShuffle); "smart" is read-only via the Web API.
+-- 1Hz poll (lastShuffle); "smart" is read-only via the backend API.
 local function shuffleState()
   if api and api.getSmartShuffle() == true then return "smart" end
   return lastShuffle and "on" or "off"
@@ -391,9 +363,9 @@ local function shuffleMenuItems()
     { title = "Off", checked = st == "off", fn = function() setShuffling(false) end },
     { title = "Shuffle", checked = st == "on", fn = function() setShuffling(true) end },
   }
-  -- Spotify owns Smart Shuffle; the API reads it but can't set it, so show it
-  -- disabled (checked only when active) whenever the Web API is wired up.
-  if api then
+  -- Smart Shuffle: the API can read it but not set it, so show it disabled
+  -- (checked only when active). Gated on backend capability.
+  if api and api.supportsSmartShuffle then
     items[#items + 1] = { title = "Smart Shuffle", checked = st == "smart", disabled = true }
   end
   return items
@@ -407,12 +379,16 @@ local function showRightClickMenu()
   -- Refresh smart-shuffle state for the *next* open; popupMenu is blocking, so
   -- this async result can't reach the menu we're about to build.
   if api then api.refresh() end
+  local appName = api and api.appName or "Player"
   local items = {
-    { title = "Open Spotify", fn = function() hs.application.launchOrFocus("Spotify") end },
+    { title = "Open " .. appName, fn = function() hs.application.launchOrFocus(appName) end },
   }
   if lastRunning then
     items[#items + 1] = { title = SHUFFLE_LABELS[shuffleState()], menu = shuffleMenuItems() }
   end
+  -- One read of the cached playlist list, shared by Add to Playlist and Play
+  -- Playlist below.
+  local playlists = (api and api.getPlaylists()) or {}
   if api and lastTrackId then
     local liked = api.getLiked()
     local trackId = lastTrackId
@@ -430,7 +406,6 @@ local function showRightClickMenu()
         fn = function() api.like(trackId); scheduleRender() end,
       }
     end
-    local playlists = api.getPlaylists() or {}
     -- Add to Playlist: only playlists you own — you can't add tracks to ones
     -- you merely follow.
     local owned = {}
@@ -454,13 +429,8 @@ local function showRightClickMenu()
       end
       items[#items + 1] = { title = "Add to Playlist", menu = subItems }
     end
-    items[#items + 1] = { title = "-" }
-    if api.playLikedSongs then
-      items[#items + 1] = {
-        title = "Play Liked Songs",
-        fn = function(mods) api.playLikedSongs(playMode(mods)) end,
-      }
-    end
+  end
+  if api then
     -- Play Playlist: recently-played pinned on top in recency order (this is
     -- where Discover Weekly / Release Radar surface when you don't follow them),
     -- then the rest of the library, deduped by id.
@@ -480,7 +450,7 @@ local function showRightClickMenu()
     for _, p in ipairs(playlists) do
       if #playItems >= MENU_PLAYLIST_LIMIT then break end
       if not pinned[p.id] then
-        local puri = "spotify:playlist:" .. p.id
+        local puri = p.uri
         playItems[#playItems + 1] = {
           title = p.name,
           image = ensureMenuIcon(p.imageUrl),
@@ -488,15 +458,31 @@ local function showRightClickMenu()
         }
       end
     end
+    -- Only emit the separator when a Play group actually follows it, so a
+    -- backend with no liked-songs surface and no playlists yet (Apple Music
+    -- before its library loads) doesn't show a dangling divider.
+    if api.playLikedSongs or #playItems > 0 then
+      items[#items + 1] = { title = "-" }
+    end
+    if api.playLikedSongs then
+      items[#items + 1] = {
+        title = "Play Liked Songs",
+        fn = function(mods) api.playLikedSongs(playMode(mods)) end,
+      }
+    end
     if #playItems > 0 then
       items[#items + 1] = { title = "Play Playlist", menu = playItems }
     end
     api.refreshPlaylists()
     api.refreshRecentlyPlayed()
   end
-  if api then
+  if api and api.supportsReauth then
     items[#items + 1] = { title = "-" }
     items[#items + 1] = { title = "Re-authenticate", fn = function() api.authenticate() end }
+  end
+  if switchBackend then
+    items[#items + 1] = { title = "-" }
+    items[#items + 1] = { title = "Switch to " .. switchLabel, fn = switchBackend }
   end
   menu:setMenu(items)
   menu:popupMenu(hs.mouse.absolutePosition(), true)
@@ -532,6 +518,8 @@ module.start = function(deps)
   badge = deps.badge
   api = deps.api
   hideContext = deps.hideContext
+  switchLabel = deps.switchLabel
+  switchBackend = deps.switchBackend
   -- autosaveName lets macOS remember this pill's position (⌘-drag) across reloads.
   menu = hs.menubar.new(true, "hammertunes")
   if not menu then
@@ -571,7 +559,7 @@ module.start = function(deps)
         holdFired = true
         clearPending()
         seekToMouse()
-        hs.spotify.play()
+        api.play()
       end)
     elseif etype == hs.eventtap.event.types.leftMouseDragged and holdFired then
       if hs.timer.secondsSinceEpoch() - lastSeekTime >= SEEK_THROTTLE_SEC then
@@ -598,5 +586,8 @@ module.stop = function()
   artCache, artFetching, artCacheCount = {}, {}, 0
   menuIconCache, menuIconFetching, menuIconCacheCount = {}, {}, 0
 end
+
+-- Pure helpers exposed for unit tests (see tests/).
+module._test = { truncate = truncate, playMode = playMode }
 
 return module

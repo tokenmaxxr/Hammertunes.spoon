@@ -173,6 +173,7 @@ module.new = function(menu, baseOpts, opts)
       subtitle = renderOpts.subtitle,
       leadingImage = renderOpts.leadingImage,
       likedOverlay = renderOpts.likedOverlay,
+      likedColor = renderOpts.likedColor,
     })), false)
   end
 

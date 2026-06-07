@@ -1,11 +1,17 @@
 # Hammertunes.spoon
 
+<p align="center">
+  <img src="https://images1.memedroid.com/images/UPLOADED5/5034ea1a8efe9.jpeg" alt="MC Hammer — Stop! Hammer Time!" width="400"><br>
+  <em>Stop! Hammertunes.</em>
+</p>
+
 A menubar **pill** for [Hammerspoon](https://www.hammerspoon.org/) that shows
 what's playing and lets you control it - artwork, a live progress bar,
 press-and-hold scrubbing, click-zone transport, and a rich right-click menu.
 
-Currently backed by **Spotify** (AppleScript + Web API). The backend sits behind
-a small interface so **Apple Music** can be added later.
+Works with **Spotify** (AppleScript + Web API) or **Apple Music** (AppleScript +
+the private MediaRemote framework), selectable at runtime - both sit behind a
+small shared backend interface, and you can flip between them from the menu.
 
 ## Features
 
@@ -54,19 +60,35 @@ hs.loadSpoon("Hammertunes")
 spoon.Hammertunes:start()
 ```
 
+## Choosing a backend
+
+Spotify is the default. To use Apple Music (no setup or auth needed):
+
+```lua
+spoon.Hammertunes:start({ backend = "applemusic" })
+-- or
+spoon.Hammertunes:setBackend("applemusic"):start()
+```
+
+Or just flip between them from the pill's **right-click menu → "Switch to …"**.
+That choice is saved and **takes precedence** over `:setBackend()` / `opts.backend`
+on later launches, so you can leave your `init.lua` as-is and toggle from the menu.
+
 ## Requirements
 
 - macOS + Hammerspoon
-- The Spotify desktop app (transport/state go through it via AppleScript)
-- A Spotify account; a free Spotify developer app for the Web API features
+- The Spotify or Apple Music (**Music**) desktop app - transport and state go
+  through it via AppleScript.
+- For Spotify's Web API extras (playlists, like, context name): a Spotify account
+  and a free Spotify developer app. Apple Music needs none of this.
 
-## Status / roadmap
+## Status
 
-- ✅ Spotify backend (transport, state, playlists, like, recently-played).
-- ⏳ Apple Music backend - reserved in `backends/applemusic.lua`. Needs the
-  state-fetch (`SPOTIFY_QUERY` AppleScript) and transport (`hs.spotify.*`) in
-  `pill.lua` lifted behind the backend interface so `hs.itunes` / the Music app
-  can slot in. See the notes in that file.
+- ✅ **Spotify** - transport, state, playlists, like, recently-played, shuffle.
+- ✅ **Apple Music** - transport, now-playing, artwork and favorite for library
+  tracks, and library playlists. Streaming catalog tracks (which the Music
+  AppleScript dictionary can't read on macOS Tahoe) fall back to the private
+  MediaRemote framework for title/artist/progress.
 
 ## License
 
