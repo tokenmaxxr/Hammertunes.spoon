@@ -416,6 +416,12 @@ local function showRightClickMenu()
         fn = function() api.like(trackId); scheduleRender() end,
       }
     end
+    -- Same "Song by Artist" copy as a double-click on the pill's middle, surfaced
+    -- in the menu for discoverability. Gated on artist so it never copies a bare
+    -- title.
+    if lastTrack and lastArtist then
+      items[#items + 1] = { title = "Copy \u{201C}Song by Artist\u{201D}", fn = copyCurrent }
+    end
     -- Add to Playlist: only playlists you own — you can't add tracks to ones
     -- you merely follow.
     local owned = {}
