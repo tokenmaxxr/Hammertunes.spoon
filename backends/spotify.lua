@@ -896,7 +896,7 @@ local function setupWizard()
     "", "Continue", "Cancel"
   )
   if btn ~= "Continue" then return end
-  clientId = clientId and clientId:gsub("%s+", "") or ""
+  clientId = (clientId or ""):gsub("%s+", "")
   if clientId == "" then
     hs.alert.show("Spotify setup cancelled (no Client ID)")
     return
@@ -906,12 +906,14 @@ end
 
 module.needsSetup = needsSetup
 module.setup = setupWizard
+-- Menu label for the setup item, kept here so pill.lua stays backend-agnostic.
+module.setupLabel = "Enable Spotify extras…"
 
 module.start = function(changeCallback)
   onChange = changeCallback
   loadCreds()
   loadPlaylistsCache()
-  if not (cachedClientId and cachedRefreshToken) then
+  if needsSetup() then
     log.i("not authenticated; skipping context fetch")
     -- Offer the guided setup once, ever (deferred so the pill renders first).
     -- The flag is set when shown, not on success, so declining doesn't re-prompt.

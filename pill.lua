@@ -477,11 +477,12 @@ local function showRightClickMenu()
     api.refreshRecentlyPlayed()
   end
   if api and api.needsSetup and api.needsSetup() then
-    -- Spotify, not yet authenticated: offer the guided setup. Deferred via
-    -- doAfter(0) because the wizard is modal and popupMenu is still blocking.
+    -- Backend needs first-time setup: offer its guided flow with the backend's
+    -- own label. Deferred via doAfter(0) because the wizard is modal and
+    -- popupMenu is still blocking.
     items[#items + 1] = { title = "-" }
     items[#items + 1] = {
-      title = "Enable Spotify extras…",
+      title = api.setupLabel or "Enable extras…",
       fn = function() hs.timer.doAfter(0, function() api.setup() end) end,
     }
   elseif api and api.supportsReauth then
