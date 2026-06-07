@@ -9,9 +9,10 @@ A menubar **pill** for [Hammerspoon](https://www.hammerspoon.org/) that shows
 what's playing and lets you control it - artwork, a live progress bar,
 press-and-hold scrubbing, click-zone transport, and a rich right-click menu.
 
-It works with **Spotify** or **Apple Music**. Most people use one or the other,
-so the setup below is split into two self-contained guides - **jump straight to
-[Spotify](#-spotify) or [Apple Music](#-apple-music)** and follow only that one.
+It works with **Spotify** or **Apple Music** (alpha - not tested yet). Most
+people use one or the other, so the setup below is split into two
+self-contained guides - **jump straight to [Spotify](#-spotify) or
+[Apple Music](#-apple-music-alpha)** and follow only that one.
 
 <p align="center">
   <img src="docs/pill.png" alt="The Hammertunes pill in the macOS menubar with its right-click menu open, showing playback controls, shuffle, like, and playlist options" width="720"><br>
@@ -33,7 +34,7 @@ so the setup below is split into two self-contained guides - **jump straight to
 ## 🟢 Spotify
 
 > **Read this section if you use Spotify.** It's everything you need, start to
-> finish. (Apple Music users: skip to [Apple Music](#-apple-music).)
+> finish. (Apple Music users: skip to [Apple Music](#-apple-music-alpha).)
 
 ### Requirements
 
@@ -122,8 +123,12 @@ API setup from step 3.
 
 ---
 
-## 🔴 Apple Music
+## 🔴 Apple Music (alpha)
 
+> ⚠️ **Alpha - not tested yet.** The Apple Music backend is implemented but
+> hasn't been exercised against a real library; expect rough edges and please
+> [report issues](https://github.com/tokenmaxxr/Hammertunes.spoon/issues).
+>
 > **Read this section if you use Apple Music.** It's everything you need, start
 > to finish. No account, developer app, or login required.
 
@@ -197,9 +202,10 @@ so you can leave your config as-is and toggle from the menu whenever you like.
 ## Status
 
 - ✅ **Spotify** - transport, state, playlists, like, recently-played, shuffle.
-- ✅ **Apple Music** - transport, now-playing, artwork and favorite for library
-  tracks, library playlists, and a MediaRemote fallback for streaming tracks on
-  macOS Tahoe.
+- ⚠️ **Apple Music (alpha, not tested yet)** - transport, now-playing, artwork
+  and favorite for library tracks, library playlists, and a MediaRemote fallback
+  for streaming tracks on macOS Tahoe. Implemented but not yet exercised against
+  a real library.
 
 ## Development
 
