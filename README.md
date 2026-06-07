@@ -113,6 +113,7 @@ API setup from step 3.
 - **Shuffle:** Off / Shuffle, plus a read-only **Smart Shuffle** state (Spotify
   owns Smart Shuffle; the pill can show it but not toggle it).
 - **Like / Unlike** the current track.
+- **Copy "Song by Artist"** and **Open on YouTube** for the current track.
 - **Add to Playlist** - playlists you own, with cover thumbnails.
 - **Play Playlist** - your library with cover thumbnails; recently-played
   playlists are pinned on top (the only way Discover Weekly / Release Radar show
@@ -176,6 +177,7 @@ That's it - no auth step. (Equivalent: `spoon.Hammertunes:setBackend("applemusic
 
 - **Shuffle:** Off / Shuffle (Apple Music has no Smart Shuffle).
 - **Favorite / Unfavorite** the current track.
+- **Copy "Song by Artist"** and **Open on YouTube** for the current track.
 - **Add to Playlist** - your library playlists.
 - **Play Playlist** - your library playlists (no cover thumbnails).
 - **Switch to Spotify** - see [Switching backends](#switching-backends).

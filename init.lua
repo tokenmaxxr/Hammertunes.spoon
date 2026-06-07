@@ -6,8 +6,9 @@
 --- double-click to copy "Song by Artist", and a right-click menu for shuffle
 --- modes, like/unlike, and playlist management with cover thumbnails.
 ---
---- Currently backed by Spotify (AppleScript + Web API). The backend lives behind
---- a small interface (`backends/`) so Apple Music can slot in later.
+--- Backed by Spotify (AppleScript + Web API) or Apple Music (alpha); both live
+--- behind a small shared interface (`backends/`). Switch from the right-click
+--- menu or via :setBackend().
 ---
 --- Usage:
 ---   hs.loadSpoon("Hammertunes")
@@ -78,10 +79,14 @@ end
 -- concrete backend (Spotify / Apple Music) is chosen via :setBackend().
 -- Every fresh load is checked against the backend interface so contract
 -- violations surface immediately at startup, not on a menu click later.
+-- The interface module is stateless, so it's loaded once and reused across
+-- backend switches.
+local interface = nil
 local function backend(self)
   if not self._backend then
+    interface = interface or load(self, "backends/interface.lua")
     local rel = "backends/" .. self._backendName .. ".lua"
-    self._backend = load(self, "backends/interface.lua").verify(load(self, rel), rel)
+    self._backend = interface.verify(load(self, rel), rel)
   end
   return self._backend
 end

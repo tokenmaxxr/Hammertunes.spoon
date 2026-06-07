@@ -113,28 +113,22 @@ local function ensureArt(artUrl, artPath)
   return nil
 end
 
--- Returns a cached, menu-sized hs.image for a cover URL, or nil while a miss
--- kicks off the async fetch for a later menu open.
-local function ensureMenuIcon(url)
-  return menuIcons.getUrl(url)
-end
-
 -- Warm the menu-icon cache for every known playlist so the first right-click
--- already has thumbnails. Cheap once warm: ensureMenuIcon short-circuits on
+-- already has thumbnails. Cheap once warm: getUrl short-circuits on
 -- cached/in-flight URLs, so this is just table lookups after the initial fetch.
 local function prewarmMenuIcons()
   if not api then return end
   local pls = api.getPlaylists()
   if pls then
-    for _, p in ipairs(pls) do ensureMenuIcon(p.imageUrl) end
+    for _, p in ipairs(pls) do menuIcons.getUrl(p.imageUrl) end
   end
   local recent = api.getRecentlyPlayed()
   if recent then
-    for _, r in ipairs(recent) do ensureMenuIcon(r.imageUrl) end
+    for _, r in ipairs(recent) do menuIcons.getUrl(r.imageUrl) end
   end
 end
 
-local function setBadge(text, progress, subtitle, artUrl, artPath, liked)
+local function setPill(text, progress, subtitle, artUrl, artPath, liked)
   local art = ensureArt(artUrl, artPath)
   local artKey = artUrl or artPath
   pill.update(text, {
@@ -182,7 +176,7 @@ render = function()
   local ctxUri = api and api.getUri() or nil
   local ctxName = api and api.getName() or nil
   if not s.running or (hideContext and hideContext(ctxUri)) then
-    setBadge("♪")
+    setPill("♪")
     setTooltip(api and (api.appName .. " not running") or "Not running")
     return
   end
@@ -191,9 +185,9 @@ render = function()
     local main = icon .. "\u{2002}" .. truncate(s.track, MAX_TRACK)
     local subtitle = s.artist and truncate(s.artist, MAX_ARTIST) or nil
     local liked = api and api.getLiked() == true
-    setBadge(main, s.progress, subtitle, s.artUrl, s.artPath, liked)
+    setPill(main, s.progress, subtitle, s.artUrl, s.artPath, liked)
   else
-    setBadge("♪")
+    setPill("♪")
   end
   -- Tooltips have no padding control; fake margins with blank lines/leading spaces.
   local PAD = "  "
@@ -298,7 +292,7 @@ local function showRightClickMenu()
     trackId = lastTrackId,
     running = lastRunning,
     shuffle = lastShuffle,
-    menuIcon = ensureMenuIcon,
+    menuIcon = menuIcons.getUrl,
     copyCurrent = copyCurrent,
     openOnYouTube = openOnYouTube,
     scheduleRender = scheduleRender,
@@ -342,9 +336,8 @@ module.start = function(deps)
   rightclick = deps.rightclick
   api = deps.api
   local images = deps.images
-  artCache = images.newCache(MAX_ART_CACHE, {
-    onLoad = function() if render then render() end end,
-  })
+  -- render is assigned at module load time, so it's safe to hand over directly.
+  artCache = images.newCache(MAX_ART_CACHE, { onLoad = render })
   menuIcons = images.newCache(MAX_MENU_ICON_CACHE, {
     transform = function(img) return images.scaleTo(img, MENU_ICON_SIZE) end,
   })

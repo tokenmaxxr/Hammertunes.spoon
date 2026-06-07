@@ -3,6 +3,10 @@
 -- hs.menubar state and no refresh side effects — so the grouping and gating
 -- logic is unit-testable (see tests/rightclick_spec.lua).
 --
+-- build() only reads the api's caches (getPlaylists, getRecentlyPlayed); the
+-- caller is responsible for kicking off refreshes beforehand (see menubar.lua's
+-- showRightClickMenu) or the menu shows whatever was cached last.
+--
 -- ctx fields (all optional unless noted):
 --  * api            - backend (transport, state, Web API extras) or nil
 --  * track, artist, trackId, running, shuffle - now-playing state snapshot
@@ -31,17 +35,12 @@ end
 
 local SHUFFLE_LABELS = { off = "Shuffle: Off", on = "Shuffle: On", smart = "Shuffle: Smart" }
 
--- Delegates shuffle toggling to the backend and schedules a re-render.
-local function setShuffling(ctx, on)
-  ctx.api.setShuffling(on)
-  ctx.scheduleRender()
-end
-
-local function shuffleMenuItems(ctx)
-  local st = shuffleState(ctx)
+local function shuffleMenuItems(ctx, st)
   local items = {
-    { title = "Off", checked = st == "off", fn = function() setShuffling(ctx, false) end },
-    { title = "Shuffle", checked = st == "on", fn = function() setShuffling(ctx, true) end },
+    { title = "Off", checked = st == "off",
+      fn = function() ctx.api.setShuffling(false); ctx.scheduleRender() end },
+    { title = "Shuffle", checked = st == "on",
+      fn = function() ctx.api.setShuffling(true); ctx.scheduleRender() end },
   }
   -- Smart Shuffle: the API can read it but not set it, so show it disabled
   -- (checked only when active). Gated on backend capability.
@@ -151,7 +150,8 @@ module.build = function(ctx)
     items[#items + 1] = { title = "-" }
   end
   if ctx.running then
-    items[#items + 1] = { title = SHUFFLE_LABELS[shuffleState(ctx)], menu = shuffleMenuItems(ctx) }
+    local st = shuffleState(ctx)
+    items[#items + 1] = { title = SHUFFLE_LABELS[st], menu = shuffleMenuItems(ctx, st) }
   end
   if api and api.playLikedSongs then
     items[#items + 1] = {
@@ -166,9 +166,11 @@ module.build = function(ctx)
   -- checked-out Spoon is behind its remote. Clicking pulls and reloads.
   if ctx.updateAvailable and ctx.updateAvailable() then
     items[#items + 1] = { title = "-" }
+    -- updateAvailable and updateNow are always injected together (menubar.lua),
+    -- so the gate above is enough.
     items[#items + 1] = {
       title = "Update available - install now",
-      fn = function() if ctx.updateNow then ctx.updateNow() end end,
+      fn = ctx.updateNow,
     }
   end
   -- Account / backend group: a single separator, then setup-or-reauth and the

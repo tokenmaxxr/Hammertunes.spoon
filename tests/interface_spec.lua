@@ -93,3 +93,20 @@ t.test("interface: every REQUIRED member has a ---@field annotation", function()
       "missing ---@field annotation for required member " .. member)
   end
 end)
+
+t.test("interface: every @field in the REQUIRED section has a REQUIRED entry", function()
+  local f = assert(io.open(t.ROOT .. "backends/interface.lua"))
+  local source = f:read("a")
+  f:close()
+  -- The annotation block is split by the "REQUIRED" / "OPTIONAL" section
+  -- headers; fields between them must all appear in the REQUIRED table.
+  local section = assert(source:match("REQUIRED(.-)OPTIONAL"),
+    "could not locate the REQUIRED section of the @field block")
+  local count = 0
+  for member in section:gmatch("%-%-%-@field%s+(%S+)") do
+    count = count + 1
+    t.ok(iface.REQUIRED[member] ~= nil,
+      "@field " .. member .. " is in the REQUIRED section but not in REQUIRED")
+  end
+  t.ok(count > 0, "expected at least one @field in the REQUIRED section")
+end)

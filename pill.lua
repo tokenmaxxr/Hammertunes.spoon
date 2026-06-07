@@ -5,7 +5,6 @@ local DEFAULTS = {
   color = { white = 1 },
   bg = { red = 0, green = 0, blue = 0, alpha = 0.85 },
   padX = 14,
-  padY = 4,
   radius = 10,
   height = 24,
 }
@@ -18,8 +17,6 @@ local function merge(base, overrides)
   end
   return out
 end
-
-module.merge = merge
 
 module.image = function(text, opts)
   opts = merge(DEFAULTS, opts)
