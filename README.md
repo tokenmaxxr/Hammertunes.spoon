@@ -1,7 +1,7 @@
 # Hammertunes.spoon
 
 <p align="center">
-  <img src="https://images1.memedroid.com/images/UPLOADED5/5034ea1a8efe9.jpeg" alt="MC Hammer - Stop! Hammer Time!" width="400"><br>
+  <img src="docs/hammertime.jpg" alt="MC Hammer - Stop! Hammer Time!" width="400"><br>
   <em>Stop! Hammertunes.</em>
 </p>
 
