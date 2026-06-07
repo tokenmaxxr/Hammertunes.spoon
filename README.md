@@ -49,17 +49,24 @@ so the setup below is split into two self-contained guides - **jump straight to
 
 ### 1. Install
 
-It's a plain Spoon directory - no zip needed.
+With Homebrew:
+
+```sh
+brew install --cask tokenmaxxr/tap/hammertunes
+```
+
+Or with git - it's a plain Spoon directory, no zip needed:
 
 ```sh
 git clone https://github.com/tokenmaxxr/Hammertunes.spoon \
   ~/.hammerspoon/Spoons/Hammertunes.spoon
 ```
 
-Update later with `git -C ~/.hammerspoon/Spoons/Hammertunes.spoon pull` (or
-`make -C ~/.hammerspoon/Spoons/Hammertunes.spoon update`). The pill also checks
-for updates on launch and offers an **"Update available"** item in the
-right-click menu when there is one (it never installs without that click). To
+Update later with `brew upgrade --cask hammertunes` or
+`git -C ~/.hammerspoon/Spoons/Hammertunes.spoon pull` (or
+`make -C ~/.hammerspoon/Spoons/Hammertunes.spoon update`). Git installs also
+check for updates on launch and offer an **"Update available"** item in the
+right-click menu when there is one (it never installs without that click); to
 disable the check, set `spoon.Hammertunes.checkForUpdates = false` before
 `:start()`.
 
@@ -130,17 +137,24 @@ API setup from step 3.
 
 ### 1. Install
 
-It's a plain Spoon directory - no zip needed.
+With Homebrew:
+
+```sh
+brew install --cask tokenmaxxr/tap/hammertunes
+```
+
+Or with git - it's a plain Spoon directory, no zip needed:
 
 ```sh
 git clone https://github.com/tokenmaxxr/Hammertunes.spoon \
   ~/.hammerspoon/Spoons/Hammertunes.spoon
 ```
 
-Update later with `git -C ~/.hammerspoon/Spoons/Hammertunes.spoon pull` (or
-`make -C ~/.hammerspoon/Spoons/Hammertunes.spoon update`). The pill also checks
-for updates on launch and offers an **"Update available"** item in the
-right-click menu when there is one (it never installs without that click). To
+Update later with `brew upgrade --cask hammertunes` or
+`git -C ~/.hammerspoon/Spoons/Hammertunes.spoon pull` (or
+`make -C ~/.hammerspoon/Spoons/Hammertunes.spoon update`). Git installs also
+check for updates on launch and offer an **"Update available"** item in the
+right-click menu when there is one (it never installs without that click); to
 disable the check, set `spoon.Hammertunes.checkForUpdates = false` before
 `:start()`.
 
