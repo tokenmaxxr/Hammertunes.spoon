@@ -482,7 +482,7 @@ local function showRightClickMenu()
     items[#items + 1] = { title = "-" }
     items[#items + 1] = {
       title = "Enable Spotify extras…",
-      fn = function() hs.timer.doAfter(0, api.setup) end,
+      fn = function() hs.timer.doAfter(0, function() api.setup() end) end,
     }
   elseif api and api.supportsReauth then
     items[#items + 1] = { title = "-" }
