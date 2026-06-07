@@ -66,21 +66,19 @@ local function menuFrame()
   f.y = sf.h - f.y - f.h
   return hs.geometry(f)
 end
+-- Image caches (images.lua instances, created in module.start from the
+-- injected images module). artCache holds full-size cover art for the pill;
+-- async loads re-render. menuIcons holds the same cover URLs scaled down to
+-- menu-row size: the popup menu is built synchronously and popupMenu blocks,
+-- so icons must already be cached when the menu opens — these are pre-warmed
+-- from render(), and there's no onLoad because an open menu can't be updated;
+-- freshly fetched icons simply show up on the next right-click.
 local MAX_ART_CACHE = 50
-local artCache = {}
-local artCacheCount = 0
-local artFetching = {}
-
--- Separate cache for right-click menu thumbnails: same cover URLs, but scaled
--- down to menu-row size and held as ready hs.image objects. The popup menu is
--- built synchronously and popupMenu blocks, so icons must already be cached
--- when the menu opens — these are pre-warmed from render().
 local MENU_ICON_SIZE = 18
 local MENU_PLAYLIST_LIMIT = 25
 local MAX_MENU_ICON_CACHE = 100
-local menuIconCache = {}
-local menuIconCacheCount = 0
-local menuIconFetching = {}
+local artCache = nil
+local menuIcons = nil
 
 -- Backend (transport, state, Web API extras). Injected by module.start.
 -- Implements the shared api interface; both Spotify and Apple Music backends
@@ -117,90 +115,16 @@ local render
 -- library tracks. Exactly one should be non-nil; both nil is a no-op.
 -- URL art is fetched asynchronously and triggers a render() on completion.
 -- Path art is loaded synchronously (the file is already local).
--- Write an HTTP image body to a temp file and load it as an hs.image, or nil if
--- the body is missing/unreadable. Shared by the cover-art and menu-icon fetches.
-local function bodyToImage(body)
-  if not body then return nil end
-  local path = os.tmpname()
-  local f = io.open(path, "wb")
-  if not f then return nil end
-  f:write(body)
-  f:close()
-  local img = hs.image.imageFromPath(path)
-  os.remove(path)
-  return img
-end
-
 local function ensureArt(artUrl, artPath)
-  local key = artUrl or artPath
-  if not key then return nil end
-  local cached = artCache[key]
-  if cached ~= nil then return cached end
-  if artPath then
-    -- Local file: load synchronously, no async fetch needed.
-    local img = hs.image.imageFromPath(artPath) or false
-    if artCacheCount >= MAX_ART_CACHE then
-      artCache, artCacheCount = {}, 0
-    end
-    artCache[key] = img
-    artCacheCount = artCacheCount + 1
-    return img or nil
-  end
-  -- artUrl: async HTTP fetch.
-  if artFetching[key] then return nil end
-  artFetching[key] = true
-  hs.http.asyncGet(artUrl, nil, function(code, body)
-    artFetching[key] = nil
-    local img = (code == 200 and bodyToImage(body)) or nil
-    if artCacheCount >= MAX_ART_CACHE then
-      artCache, artCacheCount = {}, 0
-    end
-    artCache[key] = img or false
-    artCacheCount = artCacheCount + 1
-    if img and render then render() end
-  end)
+  if artPath then return artCache.getPath(artPath) end
+  if artUrl then return artCache.getUrl(artUrl) end
   return nil
 end
 
--- Resize via canvas, not hs.image:setSize. A setSize'd file-backed image won't
--- draw as a menu-item icon (verified: a system image and the full-size file
--- image both render, but the setSize copy shows nothing). Drawing into a canvas
--- yields a fresh bitmap that renders like the pill's own canvas icon.
-local function scaleToMenuIcon(img)
-  local c = hs.canvas.new({ x = 0, y = 0, w = MENU_ICON_SIZE, h = MENU_ICON_SIZE })
-  c:appendElements({
-    type = "image",
-    image = img,
-    imageScaling = "scaleToFit",
-    frame = { x = 0, y = 0, w = MENU_ICON_SIZE, h = MENU_ICON_SIZE },
-  })
-  local out = c:imageFromCanvas()
-  c:delete()
-  return out
-end
-
--- Returns a cached, menu-sized hs.image for a cover URL, or nil if not ready.
--- On a miss it kicks off an async fetch and caches the scaled result (or false
--- for a known failure) so a later menu open can use it. No render callback —
--- the menu can't be updated while it's open, so freshly-fetched icons simply
--- show up on the next right-click.
+-- Returns a cached, menu-sized hs.image for a cover URL, or nil while a miss
+-- kicks off the async fetch for a later menu open.
 local function ensureMenuIcon(url)
-  if not url then return nil end
-  local cached = menuIconCache[url]
-  if cached ~= nil then return cached or nil end
-  if menuIconFetching[url] then return nil end
-  menuIconFetching[url] = true
-  hs.http.asyncGet(url, nil, function(code, body)
-    menuIconFetching[url] = nil
-    local img = (code == 200 and bodyToImage(body)) or nil
-    if img then img = scaleToMenuIcon(img) end
-    if menuIconCacheCount >= MAX_MENU_ICON_CACHE then
-      menuIconCache, menuIconCacheCount = {}, 0
-    end
-    menuIconCache[url] = img or false
-    menuIconCacheCount = menuIconCacheCount + 1
-  end)
-  return nil
+  return menuIcons.getUrl(url)
 end
 
 -- Warm the menu-icon cache for every known playlist so the first right-click
@@ -570,6 +494,13 @@ module.start = function(deps)
   deps = deps or {}
   pillRenderer = deps.pill
   api = deps.api
+  local images = deps.images
+  artCache = images.newCache(MAX_ART_CACHE, {
+    onLoad = function() if render then render() end end,
+  })
+  menuIcons = images.newCache(MAX_MENU_ICON_CACHE, {
+    transform = function(img) return images.scaleTo(img, MENU_ICON_SIZE) end,
+  })
   hideContext = deps.hideContext
   switchLabel = deps.switchLabel
   switchBackend = deps.switchBackend
@@ -638,8 +569,8 @@ module.stop = function()
   lastTooltip, lastTrack, lastArtist, lastTrackId = nil, nil, nil, nil
   lastDurMs, holdFired, lastSeekTime, lastPlaying, lastLikedPoll = 0, false, 0, false, 0
   lastShuffle, lastRunning = false, false
-  artCache, artFetching, artCacheCount = {}, {}, 0
-  menuIconCache, menuIconFetching, menuIconCacheCount = {}, {}, 0
+  if artCache then artCache.reset() end
+  if menuIcons then menuIcons.reset() end
 end
 
 -- Pure helpers exposed for unit tests (see tests/).

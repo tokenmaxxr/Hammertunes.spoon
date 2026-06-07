@@ -210,6 +210,7 @@ function obj:start(opts)
   local other = otherBackend(self._backendName)
   self._menubar.start({
     pill = self._pill,
+    images = load(self, "images.lua"),
     api = backend(self),
     hideContext = self.hideContext,
     switchLabel = DISPLAY_NAMES[other],
