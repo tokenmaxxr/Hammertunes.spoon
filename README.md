@@ -1,7 +1,7 @@
 # Hammertunes.spoon
 
 <p align="center">
-  <img src="https://images1.memedroid.com/images/UPLOADED5/5034ea1a8efe9.jpeg" alt="MC Hammer — Stop! Hammer Time!" width="400"><br>
+  <img src="https://images1.memedroid.com/images/UPLOADED5/5034ea1a8efe9.jpeg" alt="MC Hammer - Stop! Hammer Time!" width="400"><br>
   <em>Stop! Hammertunes.</em>
 </p>
 
@@ -9,23 +9,40 @@ A menubar **pill** for [Hammerspoon](https://www.hammerspoon.org/) that shows
 what's playing and lets you control it - artwork, a live progress bar,
 press-and-hold scrubbing, click-zone transport, and a rich right-click menu.
 
-Works with **Spotify** (AppleScript + Web API) or **Apple Music** (AppleScript +
-the private MediaRemote framework), selectable at runtime - both sit behind a
-small shared backend interface, and you can flip between them from the menu.
+It works with **Spotify** or **Apple Music**. Most people use one or the other,
+so the setup below is split into two self-contained guides - **jump straight to
+[Spotify](#-spotify) or [Apple Music](#-apple-music)** and follow only that one.
 
-## Features
+## What it does (either backend)
 
 - **Now-playing pill** with album (or playlist) cover art, song/artist, and a
   progress bar that doubles as the menubar item.
 - **Click zones:** left = previous/restart, middle = play/pause, right = next.
 - **Press-and-hold to scrub** to a position; drag to seek.
 - **Double-click** the middle to copy "Song by Artist".
-- **Right-click menu:** shuffle (incl. read-only Smart Shuffle state),
-  like/unlike, **Add to Playlist** and **Play Playlist** with cover thumbnails,
-  Play Liked Songs. Play Playlist pins recently-played playlists (the only way
-  Discover Weekly / Release Radar show up without following them) on top.
+- **Right-click menu** for shuffle, like/favorite, and playlists. The exact
+  items differ per backend - see each guide below.
 
-## Install
+---
+
+## 🟢 Spotify
+
+> **Read this section if you use Spotify.** It's everything you need, start to
+> finish. (Apple Music users: skip to [Apple Music](#-apple-music).)
+
+### Requirements
+
+- macOS + Hammerspoon
+- The **Spotify desktop app** (transport and now-playing go through it).
+
+> **The Spotify developer app is optional.** Out of the box you get the
+> now-playing pill, transport, scrubbing, copy, and local shuffle - no account
+> setup, no login. Set up a free developer app (step 3) only if you want the
+> **Web API extras**: playlists (Add to / Play Playlist), like/unlike, Play
+> Liked Songs, the playing-context name in the tooltip, and the Smart Shuffle
+> indicator.
+
+### 1. Install
 
 It's a plain Spoon directory - no zip needed.
 
@@ -36,59 +53,129 @@ git clone https://github.com/tokenmaxxr/Hammertunes.spoon \
 
 Update later with `git -C ~/.hammerspoon/Spoons/Hammertunes.spoon pull`.
 
-## Spotify setup (one time)
+### 2. Add to your `~/.hammerspoon/init.lua`
 
-The Web API features (playlists, like, context name) need a Spotify app:
+```lua
+hs.loadSpoon("Hammertunes")
+spoon.Hammertunes:start()   -- Spotify is the default backend
+```
+
+That's the whole basic setup: the pill, transport, scrub, copy, and local
+shuffle. If you don't want the Web API extras, you're done.
+
+### 3. (Optional) Enable the Web API extras
+
+Do this only if you want playlists, like/unlike, Play Liked Songs, the context
+name, and the Smart Shuffle indicator. First create a free Spotify app, one time:
 
 1. Go to <https://developer.spotify.com/dashboard> → **Create app**.
 2. Set the **Redirect URI** to exactly `http://127.0.0.1:53127/callback`.
 3. Copy the app's **Client ID**.
 
-Then in your `~/.hammerspoon/init.lua`:
+Then authenticate once - this opens a browser to approve access:
 
 ```lua
 hs.loadSpoon("Hammertunes")
-spoon.Hammertunes:authenticate("YOUR_SPOTIFY_CLIENT_ID")  -- one time; opens a browser
+spoon.Hammertunes:authenticate("YOUR_SPOTIFY_CLIENT_ID")  -- one time
 spoon.Hammertunes:start()
 ```
 
-After the first auth, the refresh token (and Client ID) live in the macOS
-Keychain, so on later launches you only need:
+The refresh token and Client ID are saved to the macOS Keychain, so after the
+first auth you're back to just `:start()`.
 
-```lua
-hs.loadSpoon("Hammertunes")
-spoon.Hammertunes:start()
-```
+### Right-click menu (Spotify)
 
-## Choosing a backend
+Everything except local shuffle and the backend switch needs the optional Web
+API setup from step 3.
 
-Spotify is the default. To use Apple Music (no setup or auth needed):
+- **Shuffle:** Off / Shuffle, plus a read-only **Smart Shuffle** state (Spotify
+  owns Smart Shuffle; the pill can show it but not toggle it).
+- **Like / Unlike** the current track.
+- **Add to Playlist** - playlists you own, with cover thumbnails.
+- **Play Playlist** - your library with cover thumbnails; recently-played
+  playlists are pinned on top (the only way Discover Weekly / Release Radar show
+  up without following them).
+- **Play Liked Songs.**
+- **Re-authenticate** (if the token ever needs refreshing).
+- **Switch to Apple Music** - see [Switching backends](#switching-backends).
 
-```lua
-spoon.Hammertunes:start({ backend = "applemusic" })
--- or
-spoon.Hammertunes:setBackend("applemusic"):start()
-```
+---
 
-Or just flip between them from the pill's **right-click menu → "Switch to …"**.
-That choice is saved and **takes precedence** over `:setBackend()` / `opts.backend`
-on later launches, so you can leave your `init.lua` as-is and toggle from the menu.
+## 🔴 Apple Music
 
-## Requirements
+> **Read this section if you use Apple Music.** It's everything you need, start
+> to finish. No account, developer app, or login required.
+
+### Requirements
 
 - macOS + Hammerspoon
-- The Spotify or Apple Music (**Music**) desktop app - transport and state go
-  through it via AppleScript.
-- For Spotify's Web API extras (playlists, like, context name): a Spotify account
-  and a free Spotify developer app. Apple Music needs none of this.
+- The **Music app** (transport and now-playing go through it).
+- An Apple Music subscription is only needed to stream catalog tracks; the pill
+  works just as well with music already in your library (purchased or imported).
+  **The spoon itself needs no setup, developer app, or authentication.**
+
+### 1. Install
+
+It's a plain Spoon directory - no zip needed.
+
+```sh
+git clone https://github.com/tokenmaxxr/Hammertunes.spoon \
+  ~/.hammerspoon/Spoons/Hammertunes.spoon
+```
+
+Update later with `git -C ~/.hammerspoon/Spoons/Hammertunes.spoon pull`.
+
+### 2. Add to your `~/.hammerspoon/init.lua`
+
+```lua
+hs.loadSpoon("Hammertunes")
+spoon.Hammertunes:start({ backend = "applemusic" })
+```
+
+That's it - no auth step. (Equivalent: `spoon.Hammertunes:setBackend("applemusic"):start()`.)
+
+### Right-click menu (Apple Music)
+
+- **Shuffle:** Off / Shuffle (Apple Music has no Smart Shuffle).
+- **Favorite / Unfavorite** the current track.
+- **Add to Playlist** - your library playlists.
+- **Play Playlist** - your library playlists (no cover thumbnails).
+- **Switch to Spotify** - see [Switching backends](#switching-backends).
+
+### Streaming vs. library tracks
+
+For tracks **in your library**, you get full now-playing plus artwork, favorite,
+and add-to-playlist. For **streaming catalog tracks not added to your library**,
+macOS Tahoe's Music scripting can't read the current track, so the pill falls
+back to the private **MediaRemote** framework for title / artist / progress
+(artwork is usually absent, and the library-only actions - favorite,
+add-to-playlist - are hidden because they can't succeed). Transport and Play
+Playlist work either way.
+
+---
+
+## Switching backends
+
+You don't have to commit in `init.lua`. Open the pill's **right-click menu** and
+choose **"Switch to Spotify" / "Switch to Apple Music"**. That choice is saved
+and **takes precedence** over `:setBackend()` / `opts.backend` on later launches,
+so you can leave your config as-is and toggle from the menu whenever you like.
 
 ## Status
 
 - ✅ **Spotify** - transport, state, playlists, like, recently-played, shuffle.
 - ✅ **Apple Music** - transport, now-playing, artwork and favorite for library
-  tracks, and library playlists. Streaming catalog tracks (which the Music
-  AppleScript dictionary can't read on macOS Tahoe) fall back to the private
-  MediaRemote framework for title/artist/progress.
+  tracks, library playlists, and a MediaRemote fallback for streaming tracks on
+  macOS Tahoe.
+
+## Development
+
+Pure logic (state parsing, progress math, AppleScript escaping) has a small
+unit-test suite that runs without Hammerspoon:
+
+```sh
+make test   # luac -p syntax check + unit tests (needs `lua` on PATH)
+```
 
 ## License
 
