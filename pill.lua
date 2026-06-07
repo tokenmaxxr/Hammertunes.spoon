@@ -486,22 +486,25 @@ local function showRightClickMenu()
     api.refreshPlaylists()
     api.refreshRecentlyPlayed()
   end
-  if api and api.needsSetup and api.needsSetup() then
-    -- Backend needs first-time setup: offer its guided flow with the backend's
-    -- own label. Deferred via doAfter(0) because the wizard is modal and
-    -- popupMenu is still blocking.
+  -- Account / backend group: a single separator, then setup-or-reauth and the
+  -- backend switch together (no divider between them).
+  local showSetup = api and api.needsSetup and api.needsSetup()
+  if showSetup or (api and api.supportsReauth) or switchBackend then
     items[#items + 1] = { title = "-" }
-    items[#items + 1] = {
-      title = api.setupLabel or "Enable extras…",
-      fn = function() hs.timer.doAfter(0, function() api.setup() end) end,
-    }
-  elseif api and api.supportsReauth then
-    items[#items + 1] = { title = "-" }
-    items[#items + 1] = { title = "Re-authenticate", fn = function() api.authenticate() end }
-  end
-  if switchBackend then
-    items[#items + 1] = { title = "-" }
-    items[#items + 1] = { title = "Switch to " .. switchLabel, fn = switchBackend }
+    if showSetup then
+      -- Backend needs first-time setup: offer its guided flow with the backend's
+      -- own label. Deferred via doAfter(0) because the wizard is modal and
+      -- popupMenu is still blocking.
+      items[#items + 1] = {
+        title = api.setupLabel or "Enable extras…",
+        fn = function() hs.timer.doAfter(0, function() api.setup() end) end,
+      }
+    elseif api and api.supportsReauth then
+      items[#items + 1] = { title = "Re-authenticate", fn = function() api.authenticate() end }
+    end
+    if switchBackend then
+      items[#items + 1] = { title = "Switch to " .. switchLabel, fn = switchBackend }
+    end
   end
   menu:setMenu(items)
   menu:popupMenu(hs.mouse.absolutePosition(), true)

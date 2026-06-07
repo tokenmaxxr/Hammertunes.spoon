@@ -13,6 +13,11 @@ It works with **Spotify** or **Apple Music**. Most people use one or the other,
 so the setup below is split into two self-contained guides - **jump straight to
 [Spotify](#-spotify) or [Apple Music](#-apple-music)** and follow only that one.
 
+<p align="center">
+  <img src="docs/pill.png" alt="The Hammertunes pill in the macOS menubar with its right-click menu open, showing playback controls, shuffle, like, and playlist options" width="720"><br>
+  <em>The pill in the menubar - right-click for playback controls, shuffle, like, and playlists.</em>
+</p>
+
 ## What it does (either backend)
 
 - **Now-playing pill** with album (or playlist) cover art, song/artist, and a
