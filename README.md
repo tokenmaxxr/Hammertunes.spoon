@@ -65,14 +65,18 @@ shuffle. If you don't want the Web API extras, you're done.
 
 ### 3. (Optional) Enable the Web API extras
 
-Do this only if you want playlists, like/unlike, Play Liked Songs, the context
-name, and the Smart Shuffle indicator. First create a free Spotify app, one time:
+For playlists, like/unlike, Play Liked Songs, the playing-from name, and the
+Smart Shuffle indicator, open the pill's **right-click menu** and choose
+**"Enable Spotify extras…"**. It walks you through creating a free Spotify API
+key and approving access in your browser - no `init.lua` editing. The first time
+you run unauthenticated, the pill also offers this once.
+
+<details>
+<summary>Prefer to set it up by hand?</summary>
 
 1. Go to <https://developer.spotify.com/dashboard> → **Create app**.
 2. Set the **Redirect URI** to exactly `http://127.0.0.1:53127/callback`.
-3. Copy the app's **Client ID**.
-
-Then authenticate once - this opens a browser to approve access:
+3. Copy the app's **Client ID**, then authenticate once (opens a browser):
 
 ```lua
 hs.loadSpoon("Hammertunes")
@@ -80,8 +84,8 @@ spoon.Hammertunes:authenticate("YOUR_SPOTIFY_CLIENT_ID")  -- one time
 spoon.Hammertunes:start()
 ```
 
-The refresh token and Client ID are saved to the macOS Keychain, so after the
-first auth you're back to just `:start()`.
+The login is saved to the macOS Keychain, so later launches need only `:start()`.
+</details>
 
 ### Right-click menu (Spotify)
 
