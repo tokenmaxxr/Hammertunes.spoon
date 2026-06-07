@@ -57,9 +57,11 @@ git clone https://github.com/tokenmaxxr/Hammertunes.spoon \
 ```
 
 Update later with `git -C ~/.hammerspoon/Spoons/Hammertunes.spoon pull` (or
-`make -C ~/.hammerspoon/Spoons/Hammertunes.spoon update`). To be notified in the
-right-click menu when an update is available, set
-`spoon.Hammertunes.checkForUpdates = true` before `:start()`.
+`make -C ~/.hammerspoon/Spoons/Hammertunes.spoon update`). The pill also checks
+for updates on launch and offers an **"Update available"** item in the
+right-click menu when there is one (it never installs without that click). To
+disable the check, set `spoon.Hammertunes.checkForUpdates = false` before
+`:start()`.
 
 ### 2. Add to your `~/.hammerspoon/init.lua`
 
@@ -136,9 +138,11 @@ git clone https://github.com/tokenmaxxr/Hammertunes.spoon \
 ```
 
 Update later with `git -C ~/.hammerspoon/Spoons/Hammertunes.spoon pull` (or
-`make -C ~/.hammerspoon/Spoons/Hammertunes.spoon update`). To be notified in the
-right-click menu when an update is available, set
-`spoon.Hammertunes.checkForUpdates = true` before `:start()`.
+`make -C ~/.hammerspoon/Spoons/Hammertunes.spoon update`). The pill also checks
+for updates on launch and offers an **"Update available"** item in the
+right-click menu when there is one (it never installs without that click). To
+disable the check, set `spoon.Hammertunes.checkForUpdates = false` before
+`:start()`.
 
 ### 2. Add to your `~/.hammerspoon/init.lua`
 

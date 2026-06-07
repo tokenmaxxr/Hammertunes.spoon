@@ -34,12 +34,12 @@ obj.spoonPath = debug.getinfo(1, "S").source:sub(2):gsub("init%.lua$", "")
 -- (e.g. to keep a particular playlist off the menubar). Off by default.
 obj.hideContext = nil
 
--- Optional opt-in update check. Set true before :start() to compare the
--- checked-out Spoon against its git remote on launch; if behind, an "Update
+-- Update check, on by default. :start() compares the checked-out Spoon against
+-- its git remote (async, never blocks the menubar); if behind, an "Update
 -- available" item appears in the right-click menu that pulls and reloads when
--- clicked. Off by default - the Spoon never touches git unless you opt in, and
--- never pulls without a click. See also `make update`.
-obj.checkForUpdates = false
+-- clicked. It never pulls without that click. Set false before :start() to
+-- disable the check entirely. See also `make update`.
+obj.checkForUpdates = true
 
 obj._pill = nil
 obj._badge = nil
