@@ -211,6 +211,7 @@ function obj:start(opts)
   self._menubar.start({
     pill = self._pill,
     images = load(self, "images.lua"),
+    rightclick = load(self, "rightclick.lua"),
     api = backend(self),
     hideContext = self.hideContext,
     switchLabel = DISPLAY_NAMES[other],

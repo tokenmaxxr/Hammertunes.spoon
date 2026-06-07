@@ -12,5 +12,6 @@ require("spotify_spec")
 require("applemusic_spec")
 require("init_spec")
 require("menubar_spec")
+require("rightclick_spec")
 
 os.exit(t.report())

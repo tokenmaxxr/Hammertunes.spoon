@@ -1,10 +1,11 @@
 local module = {}
 local log = hs.logger.new("hammertunes", "info")
--- pillRenderer (pill.lua, draws the pill image) and api (backend) are injected
--- by init.lua via module.start{ pill=..., api=... } so this file carries no
--- require() path assumptions. Declared here as upvalues the closures below
--- close over.
+-- Collaborators are injected by init.lua via module.start{ pill=..., api=...,
+-- images=..., rightclick=... } so this file carries no require() path
+-- assumptions. Declared here as upvalues the closures below close over.
+-- pill.lua draws the pill image; rightclick.lua builds the right-click menu.
 local pillRenderer = nil
+local rightclick = nil
 
 local MAX_TRACK = 15
 local MAX_ARTIST = 18
@@ -75,7 +76,6 @@ end
 -- freshly fetched icons simply show up on the next right-click.
 local MAX_ART_CACHE = 50
 local MENU_ICON_SIZE = 18
-local MENU_PLAYLIST_LIMIT = 25
 local MAX_MENU_ICON_CACHE = 100
 local artCache = nil
 local menuIcons = nil
@@ -99,14 +99,6 @@ local function truncate(s, max)
   if len <= max then return s end
   local cut = utf8.offset(s, max)
   return s:sub(1, cut - 1) .. "…"
-end
-
--- Modifier → playback mode for the right-click "Play" items.
--- ⌘⌥ click = smart shuffle, ⌘ click = shuffle, plain = play.
-local function playMode(mods)
-  if mods and mods.cmd and mods.alt then return "smart" end
-  if mods and mods.cmd then return "shuffle" end
-  return "play"
 end
 
 local render
@@ -233,12 +225,6 @@ local function scheduleRender()
   hs.timer.doAfter(0.2, render)
 end
 
--- Delegates shuffle toggling to the backend and schedules a re-render.
-local function setShuffling(on)
-  api.setShuffling(on)
-  scheduleRender()
-end
-
 local function clearPending()
   if pendingClick then
     pendingClick:stop()
@@ -293,174 +279,34 @@ local function onMiddleClick()
   end)
 end
 
--- Current shuffle mode for the right-click menu. Regular on/off comes from the
--- 1Hz poll (lastShuffle); "smart" is read-only via the backend API.
-local function shuffleState()
-  if api and api.getSmartShuffle() == true then return "smart" end
-  return lastShuffle and "on" or "off"
-end
-
-local SHUFFLE_LABELS = { off = "Shuffle: Off", on = "Shuffle: On", smart = "Shuffle: Smart" }
-
-local function shuffleMenuItems()
-  local st = shuffleState()
-  local items = {
-    { title = "Off", checked = st == "off", fn = function() setShuffling(false) end },
-    { title = "Shuffle", checked = st == "on", fn = function() setShuffling(true) end },
-  }
-  -- Smart Shuffle: the API can read it but not set it, so show it disabled
-  -- (checked only when active). Gated on backend capability.
-  if api and api.supportsSmartShuffle then
-    items[#items + 1] = { title = "Smart Shuffle", checked = st == "smart", disabled = true }
-  end
-  return items
-end
-
 -- setMenu and setClickCallback are mutually exclusive on hs.menubar, so we
 -- attach the menu just for the popup and detach it right after. popupMenu is
 -- blocking, so the setMenu(nil) only fires once the user dismisses the menu.
 local function showRightClickMenu()
   if not menu then return end
-  -- Refresh smart-shuffle state for the *next* open; popupMenu is blocking, so
-  -- this async result can't reach the menu we're about to build.
-  if api then api.refresh() end
-  local appName = api and api.appName or "Player"
-  local items = {
-    { title = "Open " .. appName, fn = function() hs.application.launchOrFocus(appName) end },
-  }
-  -- One read of the cached playlist list, shared by Add to Playlist and Play
-  -- Playlist below.
-  local playlists = (api and api.getPlaylists()) or {}
-  if api and lastTrackId then
-    -- Separator before the now-playing track group (only emitted when at least
-    -- one track item will follow).
-    items[#items + 1] = { title = "-" }
-    local liked = api.getLiked()
-    local trackId = lastTrackId
-    -- nil happens during the auth/first-fetch race; default to Like and kick
-    -- off a refresh so the next open shows the right verb.
-    if liked == true then
-      items[#items + 1] = {
-        title = "Unlike",
-        fn = function() api.unlike(trackId); scheduleRender() end,
-      }
-    else
-      if liked == nil then api.refreshLiked(trackId) end
-      items[#items + 1] = {
-        title = "Like",
-        fn = function() api.like(trackId); scheduleRender() end,
-      }
-    end
-    -- Same "Song by Artist" copy as a double-click on the pill's middle, surfaced
-    -- in the menu for discoverability. Gated on artist so it never copies a bare
-    -- title.
-    if lastTrack and lastArtist then
-      items[#items + 1] = { title = "Copy \u{201C}Song by Artist\u{201D}", fn = copyCurrent }
-    end
-    if lastTrack then
-      items[#items + 1] = { title = "Open on YouTube", fn = openOnYouTube }
-    end
-    -- Add to Playlist: only playlists you own — you can't add tracks to ones
-    -- you merely follow.
-    local owned = {}
-    for _, p in ipairs(playlists) do
-      if p.owned then owned[#owned + 1] = p end
-    end
-    if #owned > 0 then
-      local subItems = {}
-      for _, p in ipairs(owned) do
-        if #subItems >= MENU_PLAYLIST_LIMIT then break end
-        local pid, pname = p.id, p.name
-        subItems[#subItems + 1] = {
-          title = pname,
-          image = ensureMenuIcon(p.imageUrl),
-          fn = function()
-            api.addToPlaylist(pid, trackId, function(ok)
-              hs.alert.show(ok and ("Added to " .. pname) or ("Failed to add to " .. pname))
-            end)
-          end,
-        }
-      end
-      items[#items + 1] = { title = "Add to Playlist", menu = subItems }
-    end
-  end
-  -- Playback group: Shuffle (transport-level, works without the api), then the
-  -- api-backed Play items.
-  local playItems = {}
+  -- Refresh shuffle/playlist caches for the *next* open; popupMenu is blocking,
+  -- so these async results can't reach the menu we're about to build.
   if api then
-    -- Play Playlist: recently-played pinned on top in recency order (this is
-    -- where Discover Weekly / Release Radar surface when you don't follow them),
-    -- then the rest of the library, deduped by id.
-    local recent = api.getRecentlyPlayed() or {}
-    local pinned = {}
-    for _, r in ipairs(recent) do
-      if #playItems >= MENU_PLAYLIST_LIMIT then break end
-      pinned[r.id] = true
-      local ruri = r.uri
-      playItems[#playItems + 1] = {
-        title = r.name or r.uri,
-        image = ensureMenuIcon(r.imageUrl),
-        fn = function(mods) api.playContext(ruri, playMode(mods)) end,
-      }
-    end
-    for _, p in ipairs(playlists) do
-      if #playItems >= MENU_PLAYLIST_LIMIT then break end
-      if not pinned[p.id] then
-        local puri = p.uri
-        playItems[#playItems + 1] = {
-          title = p.name,
-          image = ensureMenuIcon(p.imageUrl),
-          fn = function(mods) api.playContext(puri, playMode(mods)) end,
-        }
-      end
-    end
+    api.refresh()
     api.refreshPlaylists()
     api.refreshRecentlyPlayed()
   end
-  -- Only emit the separator when a playback group item actually follows it, so
-  -- a stopped player on a backend with no liked-songs surface and no playlists
-  -- yet (Apple Music before its library loads) doesn't show a dangling divider.
-  if lastRunning or (api and api.playLikedSongs) or #playItems > 0 then
-    items[#items + 1] = { title = "-" }
-  end
-  if lastRunning then
-    items[#items + 1] = { title = SHUFFLE_LABELS[shuffleState()], menu = shuffleMenuItems() }
-  end
-  if api and api.playLikedSongs then
-    items[#items + 1] = {
-      title = "Play Liked Songs",
-      fn = function(mods) api.playLikedSongs(playMode(mods)) end,
-    }
-  end
-  if #playItems > 0 then
-    items[#items + 1] = { title = "Play Playlist", menu = playItems }
-  end
-  -- Update notice (opt-in via spoon.checkForUpdates): only when the checked-out
-  -- Spoon is behind its remote. Clicking pulls and reloads.
-  if updateAvailable and updateAvailable() then
-    items[#items + 1] = { title = "-" }
-    items[#items + 1] = { title = "Update available - install now", fn = function() if updateNow then updateNow() end end }
-  end
-  -- Account / backend group: a single separator, then setup-or-reauth and the
-  -- backend switch together (no divider between them).
-  local showSetup = api and api.needsSetup and api.needsSetup()
-  if showSetup or (api and api.supportsReauth) or switchBackend then
-    items[#items + 1] = { title = "-" }
-    if showSetup then
-      -- Backend needs first-time setup: offer its guided flow with the backend's
-      -- own label. Deferred via doAfter(0) because the wizard is modal and
-      -- popupMenu is still blocking.
-      items[#items + 1] = {
-        title = api.setupLabel or "Enable extras…",
-        fn = function() hs.timer.doAfter(0, function() api.setup() end) end,
-      }
-    elseif api and api.supportsReauth then
-      items[#items + 1] = { title = "Re-authenticate", fn = function() api.authenticate() end }
-    end
-    if switchBackend then
-      items[#items + 1] = { title = "Switch to " .. switchLabel, fn = switchBackend }
-    end
-  end
+  local items = rightclick.build({
+    api = api,
+    track = lastTrack,
+    artist = lastArtist,
+    trackId = lastTrackId,
+    running = lastRunning,
+    shuffle = lastShuffle,
+    menuIcon = ensureMenuIcon,
+    copyCurrent = copyCurrent,
+    openOnYouTube = openOnYouTube,
+    scheduleRender = scheduleRender,
+    switchLabel = switchLabel,
+    switchBackend = switchBackend,
+    updateAvailable = updateAvailable,
+    updateNow = updateNow,
+  })
   menu:setMenu(items)
   menu:popupMenu(hs.mouse.absolutePosition(), true)
   menu:setMenu(nil)
@@ -493,6 +339,7 @@ end
 module.start = function(deps)
   deps = deps or {}
   pillRenderer = deps.pill
+  rightclick = deps.rightclick
   api = deps.api
   local images = deps.images
   artCache = images.newCache(MAX_ART_CACHE, {
@@ -574,6 +421,6 @@ module.stop = function()
 end
 
 -- Pure helpers exposed for unit tests (see tests/).
-module._test = { truncate = truncate, playMode = playMode }
+module._test = { truncate = truncate }
 
 return module
