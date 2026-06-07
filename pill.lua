@@ -295,6 +295,14 @@ local function copyCurrent()
   hs.alert.show("📋 " .. text, {}, 2)
 end
 
+-- Open a YouTube search for the current track in the default browser. A search
+-- (not a direct video) because there's no reliable track→video id mapping.
+local function openOnYouTube()
+  if not lastTrack then return end
+  local query = lastArtist and (lastTrack .. " " .. lastArtist) or lastTrack
+  hs.urlevent.openURL("https://www.youtube.com/results?search_query=" .. hs.http.encodeForQuery(query))
+end
+
 -- State lags mutating commands; refresh shortly after they fire.
 local function scheduleRender()
   hs.timer.doAfter(0.2, render)
@@ -395,13 +403,13 @@ local function showRightClickMenu()
   local items = {
     { title = "Open " .. appName, fn = function() hs.application.launchOrFocus(appName) end },
   }
-  if lastRunning then
-    items[#items + 1] = { title = SHUFFLE_LABELS[shuffleState()], menu = shuffleMenuItems() }
-  end
   -- One read of the cached playlist list, shared by Add to Playlist and Play
   -- Playlist below.
   local playlists = (api and api.getPlaylists()) or {}
   if api and lastTrackId then
+    -- Separator before the now-playing track group (only emitted when at least
+    -- one track item will follow).
+    items[#items + 1] = { title = "-" }
     local liked = api.getLiked()
     local trackId = lastTrackId
     -- nil happens during the auth/first-fetch race; default to Like and kick
@@ -423,6 +431,9 @@ local function showRightClickMenu()
     -- title.
     if lastTrack and lastArtist then
       items[#items + 1] = { title = "Copy \u{201C}Song by Artist\u{201D}", fn = copyCurrent }
+    end
+    if lastTrack then
+      items[#items + 1] = { title = "Open on YouTube", fn = openOnYouTube }
     end
     -- Add to Playlist: only playlists you own — you can't add tracks to ones
     -- you merely follow.
@@ -448,13 +459,15 @@ local function showRightClickMenu()
       items[#items + 1] = { title = "Add to Playlist", menu = subItems }
     end
   end
+  -- Playback group: Shuffle (transport-level, works without the api), then the
+  -- api-backed Play items.
+  local playItems = {}
   if api then
     -- Play Playlist: recently-played pinned on top in recency order (this is
     -- where Discover Weekly / Release Radar surface when you don't follow them),
     -- then the rest of the library, deduped by id.
     local recent = api.getRecentlyPlayed() or {}
     local pinned = {}
-    local playItems = {}
     for _, r in ipairs(recent) do
       if #playItems >= MENU_PLAYLIST_LIMIT then break end
       pinned[r.id] = true
@@ -476,23 +489,26 @@ local function showRightClickMenu()
         }
       end
     end
-    -- Only emit the separator when a Play group actually follows it, so a
-    -- backend with no liked-songs surface and no playlists yet (Apple Music
-    -- before its library loads) doesn't show a dangling divider.
-    if api.playLikedSongs or #playItems > 0 then
-      items[#items + 1] = { title = "-" }
-    end
-    if api.playLikedSongs then
-      items[#items + 1] = {
-        title = "Play Liked Songs",
-        fn = function(mods) api.playLikedSongs(playMode(mods)) end,
-      }
-    end
-    if #playItems > 0 then
-      items[#items + 1] = { title = "Play Playlist", menu = playItems }
-    end
     api.refreshPlaylists()
     api.refreshRecentlyPlayed()
+  end
+  -- Only emit the separator when a playback group item actually follows it, so
+  -- a stopped player on a backend with no liked-songs surface and no playlists
+  -- yet (Apple Music before its library loads) doesn't show a dangling divider.
+  if lastRunning or (api and api.playLikedSongs) or #playItems > 0 then
+    items[#items + 1] = { title = "-" }
+  end
+  if lastRunning then
+    items[#items + 1] = { title = SHUFFLE_LABELS[shuffleState()], menu = shuffleMenuItems() }
+  end
+  if api and api.playLikedSongs then
+    items[#items + 1] = {
+      title = "Play Liked Songs",
+      fn = function(mods) api.playLikedSongs(playMode(mods)) end,
+    }
+  end
+  if #playItems > 0 then
+    items[#items + 1] = { title = "Play Playlist", menu = playItems }
   end
   -- Update notice (opt-in via spoon.checkForUpdates): only when the checked-out
   -- Spoon is behind its remote. Clicking pulls and reloads.
