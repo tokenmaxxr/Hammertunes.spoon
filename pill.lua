@@ -476,7 +476,15 @@ local function showRightClickMenu()
     api.refreshPlaylists()
     api.refreshRecentlyPlayed()
   end
-  if api and api.supportsReauth then
+  if api and api.needsSetup and api.needsSetup() then
+    -- Spotify, not yet authenticated: offer the guided setup. Deferred via
+    -- doAfter(0) because the wizard is modal and popupMenu is still blocking.
+    items[#items + 1] = { title = "-" }
+    items[#items + 1] = {
+      title = "Enable Spotify extras…",
+      fn = function() hs.timer.doAfter(0, api.setup) end,
+    }
+  elseif api and api.supportsReauth then
     items[#items + 1] = { title = "-" }
     items[#items + 1] = { title = "Re-authenticate", fn = function() api.authenticate() end }
   end
