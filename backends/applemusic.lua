@@ -414,13 +414,17 @@ module.getState = function()
         local _, playerState, shuffleStr = result:match("^([^\t]*)\t([^\t]*)\t([^\t]*)")
         playerState = playerState or ""
         shuffleStr  = shuffleStr or "false"
-        -- This track needs MediaRemote from now on.
-        cachedPath = "mr"
         local mrData = readMediaRemote()
         if not mrData then
-          -- MediaRemote also failed; return minimal running state.
+          -- MediaRemote also failed (it's a private framework; blocked on
+          -- newer macOS). Don't pin the "mr" path: with no MR title a track
+          -- change can't be detected, so pinning would stick getState() on
+          -- this empty state forever. Re-probe AppleScript next tick instead.
+          cachedPath = nil
           return runningState(playerState == "playing", shuffleStr == "true")
         end
+        -- This track needs MediaRemote from now on.
+        cachedPath = "mr"
 
         if mrData.title ~= lastKnownTitle then
           lastKnownTitle = mrData.title
@@ -453,6 +457,10 @@ module.getState = function()
   end
 
   if not mrData then
+    -- MediaRemote went dark mid-track (or is blocked entirely). Same trap as
+    -- above: without a title, the track-change reset can't fire, so drop the
+    -- path cache and let the next tick re-probe AppleScript.
+    cachedPath = nil
     return runningState(false, shuffle)
   end
 
@@ -654,16 +662,33 @@ module.addToPlaylist = function(playlistId, trackId, cb)
     return
   end
   local safeName = asQuote(playlistName)
+  -- Plain library tracks duplicate straight into the playlist. Subscription /
+  -- URL tracks (Apple Music catalog, autoplay, stations) error with "Can only
+  -- duplicate subscription tracks to library source", so fall back to the
+  -- two-step the Music UI does implicitly: add the track to the library, find
+  -- the library copy (a new object; matched by name+artist since `duplicate to
+  -- source` returns no reference), and duplicate THAT into the playlist.
   local script = string.format([[
     tell application "Music"
       try
-        duplicate current track to playlist named "%s"
+        duplicate current track to user playlist "%s"
         return "OK"
-      on error errMsg
-        return "ERROR: " & errMsg
+      on error
+        try
+          set tn to name of current track
+          set ta to artist of current track
+          try
+            duplicate current track to source "Library"
+          end try -- harmless if it's already in the library
+          set libT to (first track of library playlist 1 whose name is tn and artist is ta)
+          duplicate libT to user playlist "%s"
+          return "OK"
+        on error errMsg
+          return "ERROR: " & errMsg
+        end try
       end try
     end tell
-  ]], safeName)
+  ]], safeName, safeName)
   local ok, result = hs.osascript.applescript(script)
   if ok and type(result) == "string" and result == "OK" then
     cb(true)
