@@ -42,9 +42,16 @@ local lastKnownTitle = nil -- used to detect track changes and reset cachedPath
 -- Artwork: exported once per library track to a PER-TRACK path. The path must
 -- be unique per track because pill.lua caches loaded images keyed by path — a
 -- single shared path would make every track show the first track's cover.
-local artCache = {}         -- [trackId] = path or false
+local artCache = {}         -- [trackId] = path or false (library tracks only)
 local ART_PATH_PREFIX = os.getenv("HOME") .. "/.hammerspoon/.hammertunes-applemusic-art-"
 local function artPathFor(trackId) return ART_PATH_PREFIX .. trackId .. ".png" end
+
+-- Many Apple Music library tracks are catalog matches with NO embedded artwork
+-- (`count of artworks of current track` is 0), so exportArt has nothing to
+-- write. MediaRemote still exposes their cover as an https URL, which we feed
+-- through the same artUrl -> images.lua HTTP cache the Spotify backend uses.
+-- Resolve it once per trackId; false means "checked, no URL available".
+local libArtUrlCache = {}   -- [trackId] = url or false
 
 -- Liked state for the current library track.
 local currentLiked = nil
@@ -60,6 +67,15 @@ local nameDirty = false
 -- Playlist cache.
 local playlistsCache = nil
 
+-- Streaming now-playing snapshot, refreshed off the hot path. The MediaRemote
+-- read is a blocking subprocess (~150 ms); running it every 1 Hz tick janks
+-- the UI, so the steady-state "mr" path refreshes this asynchronously via
+-- hs.task and serves the last good snapshot (progress is interpolated locally
+-- from the snapshot's timestamp/elapsed/rate, see mrProgress). mrTaskInFlight
+-- single-flights the background read so ticks don't pile up overlapping tasks.
+local mrSnapshot = nil
+local mrTaskInFlight = false
+
 -- Warn-once flags for degraded paths.
 local warnedMediaRemote = false
 
@@ -68,6 +84,7 @@ local warnedMediaRemote = false
 local function notRunning()
   cachedPath = nil
   lastKnownTitle = nil
+  mrSnapshot = nil
   currentName, nameDirty = nil, false
   return { running = false }
 end
@@ -151,6 +168,12 @@ end
 -- Key names confirmed against MediaRemote.framework headers and the SKaplan
 -- gist (https://gist.github.com/SKaplanOfficial/f9f5bdd6455436203d0d318c078358de)
 -- which shows the MRNowPlayingRequest synchronous approach works on macOS 15+.
+--
+-- artworkId is, for Apple Music content, a direct https cover URL - we use it
+-- as artUrl and let images.lua fetch it (see mrArtUrl). We do NOT read the raw
+-- artwork bytes: that blob is 100-400 KB and, for the Spotify/Apple Music
+-- sources this Spoon targets, artworkId is always a URL, so the bytes are never
+-- needed.
 local MEDIA_REMOTE_JXA = [[
   ObjC.import('Foundation');
   function run() {
@@ -190,6 +213,7 @@ local MEDIA_REMOTE_JXA = [[
       var duration = num('kMRMediaRemoteNowPlayingInfoDuration');
       var elapsed  = num('kMRMediaRemoteNowPlayingInfoElapsedTime');
       var rate     = num('kMRMediaRemoteNowPlayingInfoPlaybackRate');
+      var artworkId = str('kMRMediaRemoteNowPlayingInfoArtworkIdentifier');
 
       // Timestamp when the elapsed time snapshot was taken (monotonic clock).
       // If present, actual position = elapsed + (now - timestamp) * rate.
@@ -204,13 +228,34 @@ local MEDIA_REMOTE_JXA = [[
 
       return JSON.stringify({
         title: title, artist: artist, album: album,
-        duration: duration, elapsed: elapsed, rate: rate, timestamp: ts
+        duration: duration, elapsed: elapsed, rate: rate, timestamp: ts,
+        artworkId: artworkId
       });
     } catch(e) {
       return JSON.stringify({error: String(e)});
     }
   }
 ]]
+
+-- CRITICAL: MediaRemote's now-playing info only populates for a freshly spawned
+-- process on macOS Tahoe (26.x). Run in-process via hs.osascript.javascript and
+-- `localNowPlayingItem.nowPlayingInfo` comes back empty ("no nowPlayingInfo")
+-- inside Hammerspoon's long-lived JSContext - verified by running the identical
+-- JXA both ways at the same instant: a separate `osascript` process gets the
+-- track, the in-process call does not. So we shell the JXA out through osascript
+-- (sync via hs.execute, or async via hs.task). The script is written to a temp
+-- file once, lazily (passing it inline would require escaping its own quotes).
+local mrJxaPath = nil  -- temp file path, false on write failure, nil until tried
+local function jxaPath()
+  if mrJxaPath ~= nil then return mrJxaPath or nil end
+  local path = os.tmpname()
+  local f = io.open(path, "w")
+  if not f then mrJxaPath = false; return nil end
+  f:write(MEDIA_REMOTE_JXA)
+  f:close()
+  mrJxaPath = path
+  return path
+end
 
 -- Log a MediaRemote degradation once. The private framework can break across
 -- OS updates; we warn the first time and then stay quiet to avoid log spam.
@@ -221,17 +266,17 @@ local function warnMROnce(msg)
   end
 end
 
--- Call MediaRemote via JXA. Returns a table with title/artist/album/duration/
--- elapsed/rate fields, or nil on failure. Warns once on framework failure.
-local function readMediaRemote()
-  local ok, result = pcall(hs.osascript.javascript, MEDIA_REMOTE_JXA)
-  if not ok or type(result) ~= "string" then
-    warnMROnce("MediaRemote JXA call failed; streaming track metadata unavailable: " .. tostring(result))
+-- Parse the JXA's stdout (a JSON string) into a now-playing table, or nil on
+-- any failure. Shared by the sync and async readers; warns once on framework
+-- failure so a degraded MediaRemote doesn't spam the log.
+local function parseMrOutput(output)
+  if type(output) ~= "string" or output == "" then
+    warnMROnce("MediaRemote JXA call failed; streaming track metadata unavailable: " .. tostring(output))
     return nil
   end
-  local data = hs.json.decode(result)
+  local data = hs.json.decode(output)
   if not data then
-    warnMROnce("MediaRemote JXA returned non-JSON: " .. tostring(result))
+    warnMROnce("MediaRemote JXA returned non-JSON: " .. tostring(output))
     return nil
   end
   if data.error then
@@ -242,6 +287,64 @@ local function readMediaRemote()
     return nil
   end
   return data
+end
+
+-- Synchronous MediaRemote read (blocks ~150 ms). Used only where we need the
+-- answer right now and at most once per track: the first tick a streaming track
+-- is detected (FALLBACK), and resolving a library track's cover URL once per
+-- trackId (libArtUrl). The steady-state hot path uses refreshMrSnapshot instead.
+local function readMediaRemote()
+  local path = jxaPath()
+  if not path then
+    warnMROnce("MediaRemote: could not write JXA temp file; streaming metadata unavailable")
+    return nil
+  end
+  return parseMrOutput(hs.execute("/usr/bin/osascript -l JavaScript " .. path))
+end
+
+-- Kick a background MediaRemote read and store the result in mrSnapshot when it
+-- lands. Single-flighted: a tick that fires while a read is still running is a
+-- no-op, so the 1 Hz hot path never blocks or stacks up osascript processes.
+-- A failed/empty read sets mrSnapshot to nil, which the hot path treats as
+-- "MediaRemote went dark" and re-probes - self-healing.
+local function refreshMrSnapshot()
+  if mrTaskInFlight then return end
+  local path = jxaPath()
+  if not path then return end
+  mrTaskInFlight = true
+  hs.task.new("/usr/bin/osascript", function(_code, stdOut, _stdErr)
+    mrTaskInFlight = false
+    mrSnapshot = parseMrOutput(stdOut)
+  end, { "-l", "JavaScript", path }):start()
+end
+
+-- ---------------------------------------------------------------------------
+-- Streaming artwork
+-- ---------------------------------------------------------------------------
+
+-- MediaRemote's artworkId is, for Apple Music content, a direct https image URL
+-- (e.g. .../800x800bb.jpg) - present in every read, no file export needed.
+-- Return it when it looks like a URL, else nil (a source handing back an opaque
+-- identifier just gets no cover; we don't read the raw artwork bytes).
+local function mrArtUrl(mrData)
+  local id = mrData and mrData.artworkId
+  if type(id) == "string" and id:match("^https?://") then return id end
+  return nil
+end
+
+-- Resolve an artwork URL for a library track that has no embedded artwork.
+-- The now-playing item IS the current track, so MediaRemote's artworkId is its
+-- cover. Read once per trackId and cache the URL (or false) so the library hot
+-- path never re-reads MediaRemote for an already-resolved track.
+local function libArtUrl(trackId)
+  if not trackId then return nil end
+  local cached = libArtUrlCache[trackId]
+  if cached ~= nil then return cached or nil end
+  -- One blocking read per trackId (the result is cached), not a per-tick cost.
+  local mrData = readMediaRemote()
+  local url = mrData and mrArtUrl(mrData)
+  libArtUrlCache[trackId] = url or false
+  return url
 end
 
 -- ---------------------------------------------------------------------------
@@ -274,8 +377,9 @@ local function mrProgress(mrData)
 end
 
 -- Build the state table for a MediaRemote (streaming) track. Streaming tracks
--- have no library trackId, so no artwork or library actions.
-local function mrState(mrData, shuffle)
+-- have no library trackId, so no library actions and no local artPath; the
+-- cover is always the MediaRemote URL (artUrl) or nothing.
+local function mrState(mrData, shuffle, artUrl)
   local durMs, progress = mrProgress(mrData)
   local title = mrData.title
   return {
@@ -285,7 +389,7 @@ local function mrState(mrData, shuffle)
     artist   = (mrData.artist ~= "" and mrData.artist) or nil,
     progress = progress,
     durMs    = durMs,
-    artUrl   = nil,
+    artUrl   = artUrl,
     artPath  = nil,
     trackId  = nil,
     shuffle  = shuffle,
@@ -394,6 +498,11 @@ module.getState = function()
         end
 
         local artPath = exportArt(trackId)
+        -- Catalog-matched library tracks have no embedded artwork to export;
+        -- fall back to the MediaRemote cover URL so the pill isn't blank (see
+        -- the libArtUrlCache header above for why MediaRemote is the source).
+        -- `or nil` coerces the `false` from `not artPath` to nil when art exists.
+        local artUrl = (not artPath) and libArtUrl(trackId) or nil
 
         return {
           running  = true,
@@ -402,7 +511,7 @@ module.getState = function()
           artist   = artist ~= "" and artist or nil,
           progress = progress,
           durMs    = durMs,
-          artUrl   = nil,
+          artUrl   = artUrl,
           artPath  = artPath,
           trackId  = trackId,
           shuffle  = shuffle == "true",
@@ -414,6 +523,10 @@ module.getState = function()
         local _, playerState, shuffleStr = result:match("^([^\t]*)\t([^\t]*)\t([^\t]*)")
         playerState = playerState or ""
         shuffleStr  = shuffleStr or "false"
+        -- First tick this track is seen: read MediaRemote synchronously so we
+        -- show it immediately. Steady-state ticks then refresh in the
+        -- background (see the "mr" path below), so this blocking read is paid
+        -- at most once per track change, not every tick.
         local mrData = readMediaRemote()
         if not mrData then
           -- MediaRemote also failed (it's a private framework; blocked on
@@ -423,8 +536,10 @@ module.getState = function()
           cachedPath = nil
           return runningState(playerState == "playing", shuffleStr == "true")
         end
-        -- This track needs MediaRemote from now on.
+        -- This track needs MediaRemote from now on. Seed the snapshot the hot
+        -- path serves so it has data before the first async refresh lands.
         cachedPath = "mr"
+        mrSnapshot = mrData
 
         if mrData.title ~= lastKnownTitle then
           lastKnownTitle = mrData.title
@@ -433,7 +548,7 @@ module.getState = function()
           currentLiked = nil
           currentLikedTrackId = nil
         end
-        return mrState(mrData, shuffleStr == "true")
+        return mrState(mrData, shuffleStr == "true", mrArtUrl(mrData))
       end
     end
     -- AppleScript call itself failed (ok == false). Could be a transient
@@ -441,30 +556,34 @@ module.getState = function()
     return runningState(false, false)
   end
 
-  -- cachedPath == "mr": we know the current track is streaming. Skip the
-  -- full MUSIC_QUERY and go straight to MediaRemote + a cheap shuffle read.
-  local mrData = readMediaRemote()
+  -- cachedPath == "mr": we know the current track is streaming. Kick a
+  -- background MediaRemote refresh (non-blocking) and serve the last snapshot,
+  -- so the 1 Hz tick never blocks on the ~150 ms subprocess. Shuffle is a cheap
+  -- in-process read; progress is interpolated locally in mrProgress, so a
+  -- one-tick-stale snapshot still shows a smoothly advancing bar.
+  refreshMrSnapshot()
+  local mrData = mrSnapshot
   local shuffle = readShuffle()
 
-  -- Detect track change: if title changed, reset path cache to re-probe.
-  local newTitle = mrData and mrData.title or nil
-  if newTitle ~= lastKnownTitle then
-    lastKnownTitle = newTitle
-    cachedPath = nil  -- re-probe on next tick
+  if not mrData then
+    -- MediaRemote went dark mid-track (or the async read failed). Without a
+    -- title a track change can't be detected, so drop the path cache and let
+    -- the next tick re-probe AppleScript - self-healing.
+    cachedPath = nil
+    return runningState(false, shuffle)
+  end
+
+  -- Detect track change: if title changed, re-probe on the next tick (which
+  -- goes through the FALLBACK path and a fresh synchronous read).
+  if mrData.title ~= lastKnownTitle then
+    lastKnownTitle = mrData.title
+    cachedPath = nil
     nameDirty = true
     currentLiked = nil
     currentLikedTrackId = nil
   end
 
-  if not mrData then
-    -- MediaRemote went dark mid-track (or is blocked entirely). Same trap as
-    -- above: without a title, the track-change reset can't fire, so drop the
-    -- path cache and let the next tick re-probe AppleScript.
-    cachedPath = nil
-    return runningState(false, shuffle)
-  end
-
-  return mrState(mrData, shuffle)
+  return mrState(mrData, shuffle, mrArtUrl(mrData))
 end
 
 -- ---------------------------------------------------------------------------
@@ -752,6 +871,8 @@ module.stop = function()
   onChange = nil
   cachedPath = nil
   lastKnownTitle = nil
+  mrSnapshot = nil
+  mrTaskInFlight = false
   currentName = nil
   nameDirty = false
   -- Remove the per-track artwork files we exported this session.
@@ -759,6 +880,10 @@ module.stop = function()
     if type(path) == "string" then os.remove(path) end
   end
   artCache = {}
+  libArtUrlCache = {}
+  -- Remove the JXA temp file written by jxaPath() and let it be re-created.
+  if type(mrJxaPath) == "string" then os.remove(mrJxaPath) end
+  mrJxaPath = nil
   currentLiked = nil
   currentLikedTrackId = nil
   playlistsCache = nil
@@ -773,11 +898,26 @@ end
 -- interface pill.lua depends on. mrProgress reads hs.timer.secondsSinceEpoch,
 -- which the test stub makes deterministic.
 module._test = {
-  calcProgress = calcProgress,
-  mrProgress = mrProgress,
-  mrState = mrState,
-  runningState = runningState,
-  asQuote = asQuote,
+  calcProgress  = calcProgress,
+  mrProgress    = mrProgress,
+  mrState       = mrState,
+  runningState  = runningState,
+  asQuote       = asQuote,
+  mrArtUrl      = mrArtUrl,
+  parseMrOutput = parseMrOutput,
+  -- Expose internal tables/flags so tests can inspect state.
+  artCache       = function() return artCache end,
+  libArtUrlCache = function() return libArtUrlCache end,
+  mrSnapshot     = function() return mrSnapshot end,
+  -- Reset per-test: clear artwork/streaming state without calling module.stop().
+  resetArtState = function()
+    artCache       = {}
+    libArtUrlCache = {}
+    mrSnapshot     = nil
+    mrTaskInFlight = false
+    cachedPath     = nil
+    lastKnownTitle = nil
+  end,
 }
 
 return module

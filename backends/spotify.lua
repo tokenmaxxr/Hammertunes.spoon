@@ -59,6 +59,9 @@ local function shellEsc(s)
 end
 
 local function keychainGet(account)
+  -- hs.execute returns (output, success, ...) - out first, ok second. That's
+  -- the correct binding here; the reversed order vs. common `ok, out` idiom is
+  -- intentional and not a bug.
   local out, ok = hs.execute("/usr/bin/security find-generic-password -s " ..
     shellEsc(SERVICE) .. " -a " .. shellEsc(account) .. " -w 2>/dev/null")
   if not ok or not out or out == "" then return nil end
@@ -71,6 +74,8 @@ end
 -- value. Spotify rotates refresh tokens on every use; one missed save means
 -- the next reload reads the OLD (now-revoked) token and auth breaks.
 local function keychainSet(account, value)
+  -- Same (output, success, ...) binding as keychainGet - hs.execute's signature,
+  -- not a bug.
   local out, ok = hs.execute("/usr/bin/security add-generic-password -U -s " ..
     shellEsc(SERVICE) .. " -a " .. shellEsc(account) ..
     " -w " .. shellEsc(value) .. " 2>&1")
@@ -180,6 +185,7 @@ local function ensureAccessToken(callback)
         tokenFlight.flush(nil, "auth failed")
         return
       end
+      -- hs.json.decode returns nil on malformed JSON; the nil guard below handles it.
       local data = hs.json.decode(response)
       if not (data and data.access_token) then
         log.e("token refresh: malformed response")
@@ -245,6 +251,7 @@ local function fetchName(token, uri, onName)
     { Authorization = "Bearer " .. token },
     function(status, body)
       if status == 200 then
+        -- hs.json.decode returns nil on malformed JSON; the nil guard below handles it.
         local data = hs.json.decode(body)
         local name = data and data.name or nil
         if name then

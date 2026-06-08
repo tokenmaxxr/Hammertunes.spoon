@@ -98,3 +98,77 @@ t.test("spotify: singleFlight - waiter re-joining during flush starts a fresh fl
   sf.flush("TOKEN")
   t.eq(rejoined, true)
 end)
+
+-- ---------------------------------------------------------------------------
+-- getState boundary tests: drive module.getState() through the osascript stub.
+-- Each test installs its own _applescript function and restores the default
+-- (fail-closed) stub afterwards so state does not leak between tests.
+-- ---------------------------------------------------------------------------
+
+-- Sentinel restores the default fail-closed stub after each test.
+local function withApplescript(fn, body)
+  local prev = hs.osascript._applescript
+  hs.osascript._applescript = fn
+  local ok, err = pcall(body)
+  hs.osascript._applescript = prev
+  if not ok then error(err, 2) end
+end
+
+t.test("spotify: getState - osascript fails outright returns not-running", function()
+  -- Simulates the case where hs.osascript.applescript itself returns failure
+  -- (e.g. osascript not found, permission denied, or JXA crash).
+  withApplescript(
+    function(_) return false, nil end,
+    function()
+      local s = spotify.getState()
+      t.eq(s, { running = false })
+    end
+  )
+end)
+
+t.test("spotify: getState - osascript ok but empty result returns not-running", function()
+  -- The AppleScript returns "" when Spotify is not running (the else branch of
+  -- SPOTIFY_QUERY). getState must treat ok+empty the same as outright failure.
+  withApplescript(
+    function(_) return true, "" end,
+    function()
+      local s = spotify.getState()
+      t.eq(s, { running = false })
+    end
+  )
+end)
+
+t.test("spotify: getState - valid now-playing row returns fully populated state", function()
+  -- Build the row matching SPOTIFY_QUERY's 8-field tab-separated output:
+  --   state, track, artist, player_position(sec), duration(ms),
+  --   artwork_url, track_id_uri, shuffle
+  -- pos=30s, dur=60000ms -> progress = 30/(60000/1000) = 0.5
+  local row = table.concat({
+    "playing",
+    "Test Track",
+    "Test Artist",
+    "30",
+    "60000",
+    "https://i.scdn.co/image/abc",
+    "spotify:track:TESTID",
+    "true",
+  }, "\t")
+  withApplescript(
+    function(_) return true, row end,
+    function()
+      local s = spotify.getState()
+      t.eq(s, {
+        running   = true,
+        playing   = true,
+        track     = "Test Track",
+        artist    = "Test Artist",
+        progress  = 0.5,
+        durMs     = 60000,
+        artUrl    = "https://i.scdn.co/image/abc",
+        artPath   = nil,
+        trackId   = "TESTID",
+        shuffle   = true,
+      })
+    end
+  )
+end)
