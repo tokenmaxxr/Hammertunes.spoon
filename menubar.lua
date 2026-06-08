@@ -304,6 +304,13 @@ local function onClick()
     return
   end
 
+  -- Player not running: the pill is just "♪" and transport clicks would hit a
+  -- dead app, so any click launches the player instead.
+  if not lastRunning then
+    if api then hs.application.launchOrFocus(api.appName) end
+    return
+  end
+
   local frame = menuFrame()
   if not frame or frame.w <= 0 then
     onMiddleClick()
