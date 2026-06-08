@@ -1,6 +1,8 @@
 local t = require("helper")
 local spotify = t.loadModule("backends/spotify.lua")
 local parse = spotify._test.parseSpotifyState
+local parseRetryAfter = spotify._test.parseRetryAfter
+local singleFlight = spotify._test.singleFlight
 
 -- Build a SPOTIFY_QUERY result line from its 8 tab-separated fields.
 local function line(state, track, artist, pos, dur, art, uri, shuffle)
@@ -50,4 +52,49 @@ t.test("spotify: names containing tabs-safe pipes survive", function()
   local s = parse(line("playing", "A|B", "C|D", "0", "1000", "", "spotify:track:z", "false"))
   t.eq(s.track, "A|B")
   t.eq(s.artist, "C|D")
+end)
+
+t.test("spotify: retry-after parses lowercase header", function()
+  t.eq(parseRetryAfter({ ["retry-after"] = "120" }), 120)
+end)
+
+t.test("spotify: retry-after parses canonical-case header", function()
+  t.eq(parseRetryAfter({ ["Retry-After"] = "60" }), 60)
+end)
+
+t.test("spotify: retry-after defaults to an hour when missing or garbage", function()
+  t.eq(parseRetryAfter(nil), 3600)
+  t.eq(parseRetryAfter({}), 3600)
+  t.eq(parseRetryAfter({ ["Retry-After"] = "soon" }), 3600)
+end)
+
+t.test("spotify: singleFlight - only the first caller starts the work", function()
+  local sf = singleFlight()
+  t.eq(sf.join(function() end), true)
+  t.eq(sf.join(function() end), false)
+  t.eq(sf.join(function() end), false)
+end)
+
+t.test("spotify: singleFlight - flush delivers the result to every waiter in order", function()
+  local sf = singleFlight()
+  local got = {}
+  sf.join(function(tok, err) got[#got + 1] = { 1, tok, err } end)
+  sf.join(function(tok, err) got[#got + 1] = { 2, tok, err } end)
+  sf.flush("TOKEN", nil)
+  t.eq(got, { { 1, "TOKEN" }, { 2, "TOKEN" } })
+end)
+
+t.test("spotify: singleFlight - a new flight can start after flush", function()
+  local sf = singleFlight()
+  sf.join(function() end)
+  sf.flush(nil, "auth failed")
+  t.eq(sf.join(function() end), true, "flight should reset after flush")
+end)
+
+t.test("spotify: singleFlight - waiter re-joining during flush starts a fresh flight", function()
+  local sf = singleFlight()
+  local rejoined
+  sf.join(function() rejoined = sf.join(function() end) end)
+  sf.flush("TOKEN")
+  t.eq(rejoined, true)
 end)

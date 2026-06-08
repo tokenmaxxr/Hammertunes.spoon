@@ -26,7 +26,7 @@ local module = {}
 ---@field refresh fun() Re-poll async caches (context name, liked state) immediately
 ---
 --- Liked-state management
----@field refreshLiked fun(trackId: string, force?: boolean) Re-fetch liked state for a track; bypass cache when force=true
+---@field refreshLiked fun(trackId: string) Re-fetch liked state for a track (cached per current track)
 ---@field getLiked fun(): boolean|nil Cached liked state for the current track (nil = unknown/fetching)
 ---@field like fun(trackId: string) Mark a track as liked
 ---@field unlike fun(trackId: string) Remove liked from a track
@@ -71,7 +71,6 @@ local module = {}
 ---@field setupLabel string|nil Menu label for the setup item
 ---@field supportsSmartShuffle boolean|nil Backend exposes a read-only Smart Shuffle state
 ---@field supportsReauth boolean|nil "Switch account" re-auth is available for this backend
----@field likedPollSeconds number|nil Re-poll liked state every N seconds during playback
 ---@field likedColor table|nil Accent colour for the heart icon: {red, green, blue}
 
 -- ---------------------------------------------------------------------------

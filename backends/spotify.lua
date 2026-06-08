@@ -126,6 +126,35 @@ local function notify()
   if onChange then onChange() end
 end
 
+-- Coalesces concurrent callers of one async operation: the first join()
+-- returns true (that caller starts the work), later joins queue until flush()
+-- delivers the result to everyone. Pure, so it's unit-testable (see tests/).
+local function singleFlight()
+  local waiting = nil
+  local sf = {}
+  sf.join = function(cb)
+    if waiting then
+      table.insert(waiting, cb)
+      return false
+    end
+    waiting = { cb }
+    return true
+  end
+  sf.flush = function(...)
+    local list = waiting
+    waiting = nil
+    for _, cb in ipairs(list or {}) do cb(...) end
+  end
+  return sf
+end
+
+-- Token refreshes MUST be single-flight: Spotify rotates the refresh token on
+-- every use, so two concurrent refreshes both send the same token and the
+-- loser gets "invalid_grant: Refresh token revoked" (and reuse detection can
+-- revoke the whole grant). Seen in practice at startup, where refresh() and
+-- fetchRecentlyPlayed() race the first refresh.
+local tokenFlight = singleFlight()
+
 local function ensureAccessToken(callback)
   local now = hs.timer.secondsSinceEpoch()
   if accessToken and now < accessExpiry - 30 then
@@ -137,6 +166,7 @@ local function ensureAccessToken(callback)
     callback(nil)
     return
   end
+  if not tokenFlight.join(callback) then return end
   local body = "grant_type=refresh_token" ..
     "&refresh_token=" .. hs.http.encodeForQuery(cachedRefreshToken) ..
     "&client_id=" .. hs.http.encodeForQuery(cachedClientId)
@@ -147,19 +177,19 @@ local function ensureAccessToken(callback)
     function(status, response)
       if status ~= 200 then
         log.e("token refresh failed: " .. tostring(status) .. " " .. tostring(response))
-        callback(nil, "auth failed")
+        tokenFlight.flush(nil, "auth failed")
         return
       end
       local data = hs.json.decode(response)
       if not (data and data.access_token) then
         log.e("token refresh: malformed response")
-        callback(nil, "auth failed")
+        tokenFlight.flush(nil, "auth failed")
         return
       end
       accessToken = data.access_token
       accessExpiry = hs.timer.secondsSinceEpoch() + (data.expires_in or 3600)
       if data.refresh_token then saveRefreshToken(data.refresh_token) end
-      callback(accessToken)
+      tokenFlight.flush(accessToken)
     end
   )
 end
@@ -287,11 +317,37 @@ local function refresh()
   end)
 end
 
--- Liked-state for a single track. Cached per current track; pill.lua re-checks
--- on every track switch and (via the `force` arg) polls periodically during
--- playback so likes made in the Spotify app are reflected. Pass force=true to
--- bypass the cache and re-fetch.
-local function refreshLiked(trackId, force)
+-- Dev-mode apps get tight per-endpoint-group quotas (Feb 2026 API changes);
+-- the library group (/v1/me/library*) answers 429 with a multi-hour
+-- Retry-After once exhausted. Track the lockout so we stop hitting the group
+-- until it expires and can tell the user when liking will work again.
+local libraryRetryAt = 0
+
+local function parseRetryAfter(headers)
+  for k, v in pairs(headers or {}) do
+    if k:lower() == "retry-after" then return tonumber(v) or 3600 end
+  end
+  return 3600
+end
+
+-- Seconds left on the library-group lockout, or nil when not locked out.
+local function libraryLockedFor()
+  local remain = libraryRetryAt - hs.timer.secondsSinceEpoch()
+  return remain > 0 and remain or nil
+end
+
+local function noteLibraryRateLimit(headers)
+  local secs = parseRetryAfter(headers)
+  libraryRetryAt = hs.timer.secondsSinceEpoch() + secs
+  log.w("library endpoints rate-limited; retry in " .. math.floor(secs) .. "s")
+end
+
+-- Liked-state for a single track. Cache is just the current track — Spotify
+-- can be liked/unliked from any client, but re-checking on every track switch
+-- keeps the badge fresh enough. No periodic re-poll: the library endpoint
+-- group's dev-mode quota is small enough that polling earns the multi-hour
+-- 429 lockout above, which also breaks like/unlike.
+local function refreshLiked(trackId)
   if not trackId then
     if currentTrackId ~= nil or currentLiked ~= nil then
       currentTrackId, currentLiked = nil, nil
@@ -299,8 +355,15 @@ local function refreshLiked(trackId, force)
     end
     return
   end
-  if not force and trackId == currentTrackId and currentLiked ~= nil then return end
+  if trackId == currentTrackId and currentLiked ~= nil then return end
   currentTrackId = trackId
+  if libraryLockedFor() then
+    if currentLiked ~= nil then
+      currentLiked = nil
+      notify()
+    end
+    return
+  end
   ensureAccessToken(function(token)
     if not token then
       if currentLiked ~= nil then
@@ -316,7 +379,7 @@ local function refreshLiked(trackId, force)
     hs.http.asyncGet(
       "https://api.spotify.com/v1/me/library/contains?uris=" .. uri,
       { Authorization = "Bearer " .. token },
-      function(status, body)
+      function(status, body, headers)
         -- Track ID may have changed while the request was in flight.
         if trackId ~= currentTrackId then return end
         local liked = nil
@@ -325,6 +388,8 @@ local function refreshLiked(trackId, force)
           if type(data) == "table" and type(data[1]) == "boolean" then
             liked = data[1]
           end
+        elseif status == 429 then
+          noteLibraryRateLimit(headers)
         else
           log.w("liked-check: status=" .. tostring(status))
         end
@@ -727,7 +792,17 @@ local function playLikedSongs(mode)
   end)
 end
 
+local function rateLimitAlert(verb, waitSecs)
+  hs.alert.show(("Spotify: %s blocked by rate limit, try again in ~%d min")
+    :format(verb, math.max(1, math.ceil(waitSecs / 60))))
+end
+
 local function setLiked(trackId, liked, verb)
+  local wait = libraryLockedFor()
+  if wait then
+    rateLimitAlert(verb, wait)
+    return
+  end
   ensureAccessToken(function(token)
     if not token then
       hs.alert.show("Spotify: re-authenticate to " .. verb)
@@ -741,7 +816,12 @@ local function setLiked(trackId, liked, verb)
       method,
       "",
       { Authorization = "Bearer " .. token, ["Content-Type"] = "application/json" },
-      function(status)
+      function(status, _, headers)
+        if status == 429 then
+          noteLibraryRateLimit(headers)
+          rateLimitAlert(verb, libraryLockedFor() or 3600)
+          return
+        end
         if status ~= 200 then
           log.e(verb .. " failed: status=" .. tostring(status))
           hs.alert.show("Spotify: " .. verb .. " failed (" .. tostring(status) .. ")")
@@ -828,14 +908,13 @@ module.supportsSmartShuffle = true
 module.supportsReauth = true
 -- Accent for the "liked" heart on the pill (a Spotify-ish green).
 module.likedColor = { red = 0.07, green = 0.5, blue = 0.24 }
--- How often (seconds) pill.lua should re-poll the current track's liked state
--- during playback, so a like made in the Spotify app shows up without waiting
--- for a track change. Spotify only (Apple Music reads favorited every tick).
-module.likedPollSeconds = 15
-
 -- Pure helpers exposed for unit tests (see tests/). Not part of the backend
 -- interface pill.lua depends on.
-module._test = { parseSpotifyState = parseSpotifyState }
+module._test = {
+  parseSpotifyState = parseSpotifyState,
+  parseRetryAfter = parseRetryAfter,
+  singleFlight = singleFlight,
+}
 
 module.getName = function() return currentName end
 module.getUri = function() return currentUri end
