@@ -1,6 +1,6 @@
 LUA  ?= lua
 LUAC ?= luac
-SRC  := init.lua menubar.lua pill.lua rightclick.lua images.lua backends/interface.lua backends/pollinterval.lua backends/progress.lua backends/spotify.lua backends/applemusic.lua
+SRC  := $(wildcard *.lua backends/*.lua backends/*/*.lua)
 
 .PHONY: all test check update
 
@@ -12,8 +12,8 @@ update:
 
 # Syntax-check every Lua source file.
 check:
-	@for f in $(SRC); do $(LUAC) -p $$f && echo "luac OK: $$f"; done
+	@for f in $(SRC); do $(LUAC) -p "$$f" || exit $$?; echo "luac OK: $$f"; done
 
-# Syntax-check, then run the unit suite for the pure logic layer.
+# Syntax-check, then run the unit suite.
 test: check
 	@$(LUA) tests/run.lua

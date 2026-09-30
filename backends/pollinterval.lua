@@ -1,5 +1,5 @@
--- Shared now-playing poll interval (seconds between the expensive AppleScript
--- reads). Both backends load this as a sibling via dofile, the same way init.lua
+-- Shared now-playing poll interval (seconds between expensive AppleScript or
+-- MediaRemote reads). Both backends load this as a sibling via dofile, like init.lua
 -- and the test harness load backend files, so neither backend hard-codes the key,
 -- default, or clamp logic — they live here once and can't drift apart. The value
 -- is persisted under a single hs.settings key, so the right-click "Refresh

@@ -21,7 +21,7 @@ local obj = {}
 obj.__index = obj
 
 obj.name = "Hammertunes"
-obj.version = "0.1.0"
+obj.version = "0.1.1"
 obj.author = "tokenmaxxr"
 obj.homepage = "https://github.com/tokenmaxxr/Hammertunes.spoon"
 obj.license = "MIT - https://opensource.org/licenses/MIT"
@@ -48,6 +48,22 @@ obj._backend = nil
 obj._backendName = "spotify"
 obj._updateAvailable = false
 
+local generation = 0
+local updateCheck = 0
+local pendingTimers = {}
+
+-- Deferred menu/startup actions belong to the session that scheduled them.
+local function defer(delay, fn, session)
+  session = session or generation
+  if session ~= generation then return end
+  local timer
+  timer = hs.timer.doAfter(delay, function()
+    pendingTimers[timer] = nil
+    if session == generation then fn() end
+  end)
+  pendingTimers[timer] = true
+end
+
 -- hs.settings key for the user's persisted backend choice (written and read in
 -- separate methods, so it lives in one place).
 local BACKEND_SETTING_KEY = "Hammertunes.backend"
@@ -71,8 +87,11 @@ end
 -- locations are prepended to PATH.
 local function sh(cmd, cb)
   local full = "export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:$PATH; " .. cmd
-  hs.task.new("/bin/sh", function(code, out) cb(code, out or "") end, { "-c", full }):start()
+  local task = hs.task.new("/bin/sh", function(code, out) cb(code, out or "") end, { "-c", full })
+  if not task or not task:start() then cb(-1, "") end
 end
+
+local function shellQuote(s) return "'" .. s:gsub("'", "'\\''") .. "'" end
 
 -- The backend is a stateful singleton; load it once and reuse so
 -- :authenticate() and :start() share the same token/cache state. The
@@ -144,10 +163,13 @@ end
 --- Returns:
 ---  * The Hammertunes object
 function obj:checkUpdates(callback)
-  local p = self.spoonPath
-  local cmd = ("git -C '%s' fetch -q && git -C '%s' rev-list --count HEAD..@{u} 2>/dev/null")
+  updateCheck = updateCheck + 1
+  local request, session = updateCheck, generation
+  local p = shellQuote(self.spoonPath)
+  local cmd = ("git -C %s fetch -q && git -C %s rev-list --count HEAD..@{u} 2>/dev/null")
     :format(p, p)
   sh(cmd, function(code, out)
+    if session ~= generation or request ~= updateCheck then return end
     local behind = tonumber((out:gsub("%s+", ""))) or 0
     self._updateAvailable = (code == 0 and behind > 0)
     if callback then callback(self._updateAvailable, behind) end
@@ -166,10 +188,12 @@ end
 --- Returns:
 ---  * The Hammertunes object
 function obj:update()
-  sh(("git -C '%s' pull --ff-only -q"):format(self.spoonPath), function(code)
+  local session = generation
+  sh(("git -C %s pull --ff-only -q"):format(shellQuote(self.spoonPath)), function(code)
+    if session ~= generation then return end
     if code == 0 then
       hs.alert.show("Hammertunes updated - reloading…")
-      hs.timer.doAfter(0.5, hs.reload)
+      defer(0.5, hs.reload, session)
     else
       hs.alert.show("Hammertunes update failed - pull manually")
     end
@@ -207,6 +231,7 @@ end
 ---  * The Hammertunes object
 function obj:start(opts)
   if self._menubar then return self end
+  local session = generation
   -- A persisted choice from :switchBackend wins over config-time selection.
   local choice = hs.settings.get(BACKEND_SETTING_KEY) or (opts and opts.backend)
   if choice then self:setBackend(choice) end
@@ -224,16 +249,16 @@ function obj:start(opts)
     hideContext = self.hideContext,
     switchLabel = DISPLAY_NAMES[other],
     switchBackend = function()
-      hs.timer.doAfter(0, function() self:switchBackend(other) end)
+      defer(0, function() self:switchBackend(other) end, session)
     end,
     -- A getter (read fresh each menu open) plus a deferred action: :update()
     -- reloads, tearing down the menu that invoked it, so defer past popupMenu.
     updateAvailable = function() return self._updateAvailable end,
-    update = function() hs.timer.doAfter(0, function() self:update() end) end,
+    update = function() defer(0, function() self:update() end, session) end,
   })
   -- Opt-in update check, deferred so it never delays the pill appearing.
   if self.checkForUpdates then
-    hs.timer.doAfter(2, function() self:checkUpdates() end)
+    defer(2, function() self:checkUpdates() end, session)
   end
   return self
 end
@@ -248,8 +273,15 @@ end
 --- Returns:
 ---  * The Hammertunes object
 function obj:stop()
-  if self._menubar then self._menubar.stop() end
-  self._menubar = nil
+  generation = generation + 1
+  for timer in pairs(pendingTimers) do timer:stop() end
+  pendingTimers = {}
+  if self._menubar then
+    self._menubar.stop()
+  elseif self._backend then
+    self._backend.stop()
+  end
+  self._menubar, self._pill = nil, nil
   return self
 end
 

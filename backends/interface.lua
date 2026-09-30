@@ -13,6 +13,24 @@ local module = {}
 -- LuaCATS contract
 -- ---------------------------------------------------------------------------
 
+---@class HammertunesState
+---@field running boolean
+---@field playing boolean|nil
+---@field track string|nil
+---@field artist string|nil
+---@field trackId string|nil Stable library/service identity, when available
+---@field progress number|nil Fraction from 0 to 1
+---@field durMs number|nil
+---@field artUrl string|nil
+---@field artPath string|nil
+---@field shuffle boolean|nil
+---@field sourceBundleId string|nil App that owns the displayed media
+---@field sourceName string|nil Human-readable source label, separate from artist
+---@field canControl boolean|nil False prevents transport/shuffle on the displayed media; nil keeps backend defaults
+---@field canSeek boolean|nil False prevents seeking; nil requires controllable media and known duration
+---@field canLike boolean|nil False prevents like/unlike; nil requires a trackId
+---@field canAddToPlaylist boolean|nil False prevents playlist mutation; nil requires a trackId
+
 ---@class HammertunesBackend
 ---
 --- REQUIRED — both backends implement these; callers invoke them unguarded.
@@ -20,7 +38,7 @@ local module = {}
 ---@field appName string macOS app name used by launchOrFocus ("Spotify", "Music")
 ---
 --- State / polling
----@field getState fun(): table Now-playing snapshot: {running, playing, track, artist, progress, durMs, artUrl, artPath, trackId, shuffle}
+---@field getState fun(): HammertunesState Now-playing snapshot; capability flags apply to the displayed source
 ---@field start fun(changeCallback: fun()) Begin polling; call changeCallback whenever state changes
 ---@field stop fun() Tear down all timers and watchers
 ---@field refresh fun() Re-poll async caches (context name, liked state) immediately
@@ -63,7 +81,7 @@ local module = {}
 ---@field authenticate fun(clientId?: string) One-time OAuth setup; may be a no-op (Apple Music)
 ---
 --- Poll interval (shared across backends; backs the right-click "Refresh interval")
----@field getPollInterval fun(): number Seconds between the expensive AppleScript now-playing reads
+---@field getPollInterval fun(): number Seconds between expensive now-playing reads (including MediaRemote)
 ---@field setPollInterval fun(sec: number) Persist the shared poll interval; shorter is more responsive but uses more battery
 ---
 --- OPTIONAL — nil means the backend doesn't support it; menu/controller gates

@@ -51,6 +51,7 @@ local lastDurMs = 0
 local holdTimer = nil
 local holdFired = false
 local leftPressed = false
+local gestureSnapshot = nil
 local lastSeekTime = 0
 local mouseDownWatcher = nil
 local lastPlaying = false
@@ -61,6 +62,29 @@ local lastRunning = false
 -- a number (0..1) or false (reopen, no seek ratio); nil means no reopen pending.
 local menuOpen = false
 local pendingSeekRatio = nil
+local generation = 0
+local deferred = {}
+local lastState = {}
+local api = nil
+
+local function defer(delay, callback)
+  local current = generation
+  local task
+  task = hs.timer.doAfter(delay, function()
+    deferred[task] = nil
+    if current == generation and menu then callback() end
+  end)
+  deferred[task] = true
+  return task
+end
+
+local function sameTrack(snapshot)
+  local current = api and api.getState()
+  return current and current.running and current.canControl ~= false
+    and current.sourceBundleId == snapshot.sourceBundleId
+    and current.trackId == snapshot.trackId and current.track == snapshot.track
+    and current.artist == snapshot.artist
+end
 
 -- hs.menubar:frame() converts Cocoa coords using mainScreen (the focused
 -- screen), but _frame() coordinates are anchored to the primary display.
@@ -88,7 +112,6 @@ local menuIcons = nil
 -- Backend (transport, state, Web API extras). Injected by module.start.
 -- Implements the shared api interface; both Spotify and Apple Music backends
 -- slot in here.
-local api = nil
 
 -- Display label of the OTHER backend (e.g. "Apple Music") and an opaque,
 -- self-deferring callback that swaps to it. Both injected by module.start; they
@@ -118,18 +141,16 @@ local function ensureArt(artUrl, artPath)
   return nil
 end
 
--- Warm the menu-icon cache for every known playlist so the first right-click
--- already has thumbnails. Cheap once warm: getUrl short-circuits on
--- cached/in-flight URLs, so this is just table lookups after the initial fetch.
+-- Warm only the entries selected by the menu builder. Large libraries must not
+-- continually evict the visible thumbnails by fetching hidden entries.
 local function prewarmMenuIcons()
   if not api then return end
-  local pls = api.getPlaylists()
-  if pls then
-    for _, p in ipairs(pls) do menuIcons.getUrl(p.imageUrl) end
-  end
-  local recent = api.getRecentlyPlayed()
-  if recent then
-    for _, r in ipairs(recent) do menuIcons.getUrl(r.imageUrl) end
+  local ctx = {}
+  for k, v in pairs(lastState) do ctx[k] = v end
+  ctx.api = api
+  local selection = rightclick.selectEntries(ctx)
+  for _, entries in ipairs({ selection.owned, selection.play }) do
+    for _, p in ipairs(entries) do menuIcons.getUrl(p.imageUrl) end
   end
 end
 
@@ -154,7 +175,9 @@ local function setTooltip(text)
 end
 
 render = function()
+  if not menu or not pill then return end
   local s = api and api.getState() or { running = false }
+  lastState = s
   if api and s.track and (s.track ~= lastTrack or (s.playing and not lastPlaying)) then
     api.refresh()
   end
@@ -190,34 +213,37 @@ render = function()
   local lines = {}
   if s.track then lines[#lines + 1] = PAD .. "🎵\u{2002}" .. s.track end
   if s.artist then lines[#lines + 1] = PAD .. "👤\u{2002}" .. s.artist end
+  if s.sourceName then lines[#lines + 1] = PAD .. s.sourceName end
   if ctxName then lines[#lines + 1] = PAD .. "💿\u{2002}" .. ctxName end
   if #lines == 0 then setTooltip(api and api.appName or "Player") return end
   setTooltip("\n" .. table.concat(lines, "\n\n") .. "\n")
 end
 
-local function copyCurrent()
-  if not (lastTrack and lastArtist) then return end
-  local text = lastTrack .. " by " .. lastArtist
+local function copyCurrent(track, artist)
+  track, artist = track or lastTrack, artist or lastArtist
+  if not (track and artist) then return end
+  local text = track .. " by " .. artist
   hs.pasteboard.setContents(text)
   hs.alert.show("📋 " .. text, {}, 2)
 end
 
 -- Open a YouTube search for the current track in the default browser. A search
 -- (not a direct video) because there's no reliable track→video id mapping.
-local function openOnYouTube()
-  if not lastTrack then return end
-  local query = lastArtist and (lastTrack .. " " .. lastArtist) or lastTrack
+local function openOnYouTube(track, artist)
+  if not track then return end
+  local query = artist and (track .. " " .. artist) or track
   hs.urlevent.openURL("https://www.youtube.com/results?search_query=" .. hs.http.encodeForQuery(query))
 end
 
 -- State lags mutating commands; refresh shortly after they fire.
 local function scheduleRender()
-  hs.timer.doAfter(0.2, render)
+  defer(0.2, render)
 end
 
 local function clearPending()
   if pendingClick then
     pendingClick:stop()
+    deferred[pendingClick] = nil
     pendingClick = nil
   end
 end
@@ -225,11 +251,14 @@ end
 local function cancelHold()
   if holdTimer then
     holdTimer:stop()
+    deferred[holdTimer] = nil
     holdTimer = nil
   end
 end
 
 local function seekToMouse()
+  if lastState.canControl == false or lastState.canSeek == false then return end
+  if gestureSnapshot and not sameTrack(gestureSnapshot) then return end
   local frame = menuFrame()
   if not frame or frame.w <= 0 or lastDurMs <= 0 then return end
   local relX = hs.mouse.absolutePosition().x - frame.x
@@ -240,8 +269,9 @@ end
 
 local function onLeftClick()
   clearPending()
+  if lastState.canControl == false then return end
   local pos = api.getPosition() or 0
-  if pos > RESTART_THRESHOLD_SEC then
+  if pos > RESTART_THRESHOLD_SEC and lastState.canSeek ~= false then
     api.setPosition(0)
   else
     api.previous()
@@ -251,6 +281,7 @@ end
 
 local function onRightClick()
   clearPending()
+  if lastState.canControl == false then return end
   api.next()
   scheduleRender()
 end
@@ -258,12 +289,15 @@ end
 local function onMiddleClick()
   if pendingClick then
     pendingClick:stop()
+    deferred[pendingClick] = nil
     pendingClick = nil
     copyCurrent()
     return
   end
-  pendingClick = hs.timer.doAfter(DOUBLE_CLICK_SEC, function()
+  local snapshot = lastState
+  pendingClick = defer(DOUBLE_CLICK_SEC, function()
     pendingClick = nil
+    if snapshot.canControl == false or not sameTrack(snapshot) then return end
     api.playpause()
     scheduleRender()
   end)
@@ -292,6 +326,11 @@ local function showRightClickMenu(seekRatio)
   end
   local reopen
   repeat
+    local owner, currentGeneration = menu, generation
+    local snapshot = lastState
+    local function isCurrent()
+      return generation == currentGeneration and sameTrack(snapshot)
+    end
     -- Refresh shuffle/playlist caches for the *next* open; popupMenu is blocking,
     -- so these async results can't reach the menu we're about to build.
     if api then
@@ -307,24 +346,47 @@ local function showRightClickMenu(seekRatio)
       running = lastRunning,
       playing = lastPlaying,
       shuffle = lastShuffle,
+      canControl = snapshot.canControl,
+      canSeek = snapshot.canSeek,
+      canLike = snapshot.canLike,
+      canAddToPlaylist = snapshot.canAddToPlaylist,
+      isCurrent = isCurrent,
+      isActive = function() return generation == currentGeneration and menu == owner end,
+      defer = defer,
       -- Seek-to-position: only when we have a track of known length to seek within.
       seekRatio = (lastRunning and lastDurMs > 0) and seekRatio or nil,
       durMs = lastDurMs,
       seek = function(ratio)
-        if api and lastDurMs > 0 then api.setPosition(ratio * (lastDurMs / 1000)); scheduleRender() end
+        if isCurrent() and snapshot.canSeek ~= false and snapshot.canControl ~= false
+          and (snapshot.durMs or 0) > 0 then
+          api.setPosition(ratio * (snapshot.durMs / 1000)); scheduleRender()
+        end
       end,
       menuIcon = menuIcons.getUrl,
-      copyCurrent = copyCurrent,
-      openOnYouTube = openOnYouTube,
+      copyCurrent = function() copyCurrent(snapshot.track, snapshot.artist) end,
+      openOnYouTube = function() openOnYouTube(snapshot.track, snapshot.artist) end,
       scheduleRender = scheduleRender,
       switchLabel = switchLabel,
       switchBackend = switchBackend,
       updateAvailable = updateAvailable,
       updateNow = updateNow,
     })
+    local function guardItems(entries)
+      for _, item in ipairs(entries) do
+        if item.fn then
+          local action = item.fn
+          item.fn = function(...)
+            if generation == currentGeneration and menu == owner then return action(...) end
+          end
+        end
+        if item.menu then guardItems(item.menu) end
+      end
+    end
+    guardItems(items)
     menu:setMenu(items)
     menuOpen = true
     menu:popupMenu(hs.mouse.absolutePosition(), true)
+    if generation ~= currentGeneration or menu ~= owner then return end
     menuOpen = false
     menu:setMenu(nil)
     -- A right-click landed while we were open: reopen at that new position.
@@ -340,7 +402,7 @@ local function onClick(location)
   -- other backend) instead. Deferred past this callback like the right-click
   -- path, since popupMenu blocks. Right-click opens the same menu.
   if not lastRunning then
-    hs.timer.doAfter(0, showRightClickMenu)
+    defer(0, showRightClickMenu)
     return
   end
 
@@ -361,13 +423,19 @@ local function onClick(location)
 end
 
 module.start = function(deps)
+  if menu then module.stop() end
+  generation = generation + 1
+  local currentGeneration = generation
   deps = deps or {}
   pillRenderer = deps.pill
   rightclick = deps.rightclick
   api = deps.api
   local images = deps.images
   -- render is assigned at module load time, so it's safe to hand over directly.
-  artCache = images.newCache(MAX_ART_CACHE, { onLoad = render })
+  local function renderCurrent()
+    if currentGeneration == generation then render() end
+  end
+  artCache = images.newCache(MAX_ART_CACHE, { onLoad = renderCurrent })
   menuIcons = images.newCache(MAX_MENU_ICON_CACHE, {
     transform = function(img) return images.scaleTo(img, MENU_ICON_SIZE) end,
   })
@@ -386,7 +454,7 @@ module.start = function(deps)
   menu:setClickCallback(function() onClick() end)
   pill = pillRenderer.new(menu, PILL_OPTS, { progressSteps = PILL_PROGRESS_STEPS })
   render()
-  timer = hs.timer.doEvery(1, render):start()
+  timer = hs.timer.doEvery(1, renderCurrent):start()
   mouseDownWatcher = hs.eventtap.new({
     hs.eventtap.event.types.leftMouseDown,
     hs.eventtap.event.types.leftMouseUp,
@@ -407,7 +475,12 @@ module.start = function(deps)
         local frame = menuFrame()
         local loc = event:location()
         if frame and hs.geometry(loc):inside(frame) then
-          hs.timer.doAfter(0, function() onClick(loc) end)
+          local snapshot = gestureSnapshot
+          defer(0, function()
+            -- Read-only media still supports the center double-click to copy.
+            if snapshot and snapshot.canControl == false then onClick(loc)
+            elseif snapshot and sameTrack(snapshot) then onClick(loc) end
+          end)
         end
       end
       return true
@@ -430,7 +503,7 @@ module.start = function(deps)
       -- "Seek to <time>" jump to that position (same mapping as seekToMouse).
       local seekRatio = math.max(0, math.min(1, (loc.x - frame.x) / frame.w))
       -- Defer to next tick so we don't show UI from inside the eventtap callback.
-      hs.timer.doAfter(0, function() showRightClickMenu(seekRatio) end)
+      defer(0, function() showRightClickMenu(seekRatio) end)
       return true
     end
     if etype == hs.eventtap.event.types.leftMouseDown then
@@ -443,10 +516,14 @@ module.start = function(deps)
       -- Inactive pill is menu-only: no hold-to-seek on a dead player.
       if not lastRunning then return false end
       leftPressed = true
-      holdTimer = hs.timer.doAfter(HOLD_THRESHOLD_SEC, function()
+      local snapshot = lastState
+      gestureSnapshot = snapshot
+      holdTimer = defer(HOLD_THRESHOLD_SEC, function()
         holdTimer = nil
         holdFired = true
         clearPending()
+        if snapshot.canControl == false or snapshot.canSeek == false
+          or not sameTrack(snapshot) then return end
         seekToMouse()
         api.play()
       end)
@@ -454,11 +531,14 @@ module.start = function(deps)
     end
     return false
   end):start()
-  if api then api.start(render) end
+  if api then api.start(renderCurrent) end
   log.i("hammertunes pill started")
 end
 
 module.stop = function()
+  generation = generation + 1
+  for task in pairs(deferred) do task:stop() end
+  deferred = {}
   if timer then timer:stop() end
   if pendingClick then pendingClick:stop() end
   cancelHold()
@@ -469,6 +549,8 @@ module.stop = function()
   lastTooltip, lastTrack, lastArtist, lastTrackId = nil, nil, nil, nil
   lastDurMs, holdFired, lastSeekTime, lastPlaying = 0, false, 0, false
   leftPressed = false
+  gestureSnapshot = nil
+  lastState = {}
   lastShuffle, lastRunning, menuOpen, pendingSeekRatio = false, false, false, nil
   if artCache then artCache.reset() end
   if menuIcons then menuIcons.reset() end

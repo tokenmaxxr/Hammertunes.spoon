@@ -40,6 +40,7 @@ local nameCache = {}
 local imageCache = {}
 local currentTrackId = nil
 local currentLiked = nil
+local likedFetching = false
 -- Real Spotify "Smart Shuffle" state. Read-only: the Web API exposes it on the
 -- player object but offers no endpoint to set it, so the menu only displays it.
 local currentSmartShuffle = nil
@@ -54,7 +55,50 @@ local recentlyPlayedFetchedAt = 0
 local RECENTLY_PLAYED_FRESH_SEC = 30
 local authServer = nil
 local authServerTimer = nil
+local authExchangeTimer = nil
+local authorizationGeneration = 0
 local onChange = nil
+local generation, authGeneration = 0, 0
+local timers = {}
+local playerRequest, contextRevision, likedRequest, recentRequest = 0, 0, 0, 0
+
+-- UI work belongs to one start/stop lifetime. Token rotation has a separate
+-- lifetime: an in-flight refresh must still save its replacement credential.
+local function guard(callback)
+  local born = generation
+  return function(...)
+    if born == generation then return callback(...) end
+  end
+end
+
+local function later(delay, callback)
+  local timer
+  timer = hs.timer.doAfter(delay, guard(function()
+    timers[timer] = nil
+    callback()
+  end))
+  timers[timer] = true
+  return timer
+end
+
+local function invalidateWork()
+  generation = generation + 1
+  for timer in pairs(timers) do timer:stop() end
+  timers = {}
+  playlistsFetching = false
+  likedFetching = false
+end
+
+-- Every Web API completion is guarded, including intermediate callbacks that
+-- would otherwise launch another request or resume a playback command.
+local http = {}
+for _, method in ipairs({ "asyncGet", "doAsyncRequest" }) do
+  http[method] = function(...)
+    local args = table.pack(...)
+    args[args.n] = guard(args[args.n])
+    return hs.http[method](table.unpack(args, 1, args.n))
+  end
+end
 
 -- Keychain reads shell out (~50ms each). Cache after first load; the module
 -- updates the cache when it rotates the refresh token.
@@ -169,6 +213,7 @@ end
 local tokenFlight = singleFlight()
 
 local function ensureAccessToken(callback)
+  callback = guard(callback)
   local now = hs.timer.secondsSinceEpoch()
   if accessToken and now < accessExpiry - 30 then
     callback(accessToken)
@@ -180,6 +225,7 @@ local function ensureAccessToken(callback)
     return
   end
   if not tokenFlight.join(callback) then return end
+  local flight, auth = tokenFlight, authGeneration
   local body = "grant_type=refresh_token" ..
     "&refresh_token=" .. hs.http.encodeForQuery(cachedRefreshToken) ..
     "&client_id=" .. hs.http.encodeForQuery(cachedClientId)
@@ -188,22 +234,23 @@ local function ensureAccessToken(callback)
     body,
     { ["Content-Type"] = "application/x-www-form-urlencoded" },
     function(status, response)
+      if auth ~= authGeneration then return end
       if status ~= 200 then
         log.e("token refresh failed: " .. tostring(status) .. " " .. tostring(response))
-        tokenFlight.flush(nil, "auth failed")
+        flight.flush(nil, "auth failed")
         return
       end
       -- hs.json.decode returns nil on malformed JSON; the nil guard below handles it.
       local data = hs.json.decode(response)
       if not (data and data.access_token) then
         log.e("token refresh: malformed response")
-        tokenFlight.flush(nil, "auth failed")
+        flight.flush(nil, "auth failed")
         return
       end
       accessToken = data.access_token
       accessExpiry = hs.timer.secondsSinceEpoch() + (data.expires_in or 3600)
       if data.refresh_token then saveRefreshToken(data.refresh_token) end
-      tokenFlight.flush(accessToken)
+      flight.flush(accessToken)
     end
   )
 end
@@ -222,7 +269,7 @@ end
 -- og:title from the public open.spotify.com page, which still works.
 local function fetchViaScrape(kind, id, onName)
   local url = "https://open.spotify.com/" .. kind .. "/" .. id
-  hs.http.asyncGet(url, { ["User-Agent"] = "Mozilla/5.0" }, function(status, body)
+  http.asyncGet(url, { ["User-Agent"] = "Mozilla/5.0" }, function(status, body)
     if status ~= 200 or not body then
       onName(nil)
       return
@@ -254,7 +301,7 @@ local function fetchName(token, uri, onName)
     onName(nil)
     return
   end
-  hs.http.asyncGet(
+  http.asyncGet(
     "https://api.spotify.com/v1/" .. endpoint,
     { Authorization = "Bearer " .. token },
     function(status, body)
@@ -277,7 +324,10 @@ local function fetchName(token, uri, onName)
 end
 
 local function refresh()
+  playerRequest = playerRequest + 1
+  local request = playerRequest
   ensureAccessToken(function(token, err)
+    if request ~= playerRequest then return end
     if not token then
       if err and currentName ~= "<auth failed>" then
         currentUri = nil
@@ -290,10 +340,11 @@ local function refresh()
       currentName = nil
       notify()
     end
-    hs.http.asyncGet(
+    http.asyncGet(
       "https://api.spotify.com/v1/me/player",
       { Authorization = "Bearer " .. token },
       function(status, body)
+        if request ~= playerRequest then return end
         -- 204 = device idle (paused too long). Keep the last known context
         -- so the tooltip stays useful instead of going blank between sessions.
         if status == 204 then return end
@@ -315,7 +366,10 @@ local function refresh()
         local uri = ctx and ctx.uri or nil
         if uri == currentUri then return end
         currentUri = uri
+        contextRevision = contextRevision + 1
+        local revision = contextRevision
         local function setName(name)
+          if revision ~= contextRevision or uri ~= currentUri then return end
           if name == currentName then return end
           currentName = name
           notify()
@@ -363,6 +417,10 @@ end
 -- group's dev-mode quota is small enough that polling earns the multi-hour
 -- 429 lockout above, which also breaks like/unlike.
 local function refreshLiked(trackId)
+  if trackId ~= currentTrackId then
+    currentLiked, likedFetching = nil, false
+    likedRequest = likedRequest + 1
+  end
   if not trackId then
     if currentTrackId ~= nil or currentLiked ~= nil then
       currentTrackId, currentLiked = nil, nil
@@ -370,7 +428,9 @@ local function refreshLiked(trackId)
     end
     return
   end
-  if trackId == currentTrackId and currentLiked ~= nil then return end
+  if trackId == currentTrackId and (currentLiked ~= nil or likedFetching) then return end
+  likedRequest = likedRequest + 1
+  local request = likedRequest
   currentTrackId = trackId
   if libraryLockedFor() then
     if currentLiked ~= nil then
@@ -379,8 +439,11 @@ local function refreshLiked(trackId)
     end
     return
   end
+  likedFetching = true
   ensureAccessToken(function(token)
+    if request ~= likedRequest then return end
     if not token then
+      likedFetching = false
       if currentLiked ~= nil then
         currentLiked = nil
         notify()
@@ -391,12 +454,13 @@ local function refreshLiked(trackId)
     -- March 2026; the old endpoint silently 403s for development-mode apps.
     -- New endpoint takes URIs (spotify:track:ID) instead of bare IDs.
     local uri = hs.http.encodeForQuery("spotify:track:" .. trackId)
-    hs.http.asyncGet(
+    http.asyncGet(
       "https://api.spotify.com/v1/me/library/contains?uris=" .. uri,
       { Authorization = "Bearer " .. token },
       function(status, body, headers)
         -- Track ID may have changed while the request was in flight.
-        if trackId ~= currentTrackId then return end
+        if request ~= likedRequest or trackId ~= currentTrackId then return end
+        likedFetching = false
         local liked = nil
         if status == 200 then
           local data = hs.json.decode(body)
@@ -444,7 +508,7 @@ local function fetchUserId(callback)
   if currentUserId then callback(currentUserId) return end
   ensureAccessToken(function(token)
     if not token then callback(nil) return end
-    hs.http.asyncGet(
+    http.asyncGet(
       "https://api.spotify.com/v1/me",
       { Authorization = "Bearer " .. token },
       function(status, body)
@@ -490,7 +554,7 @@ local function fetchPlaylists(callback)
       if not token then done(nil) return end
       local results = {}
       local function fetchPage(url)
-        hs.http.asyncGet(url, { Authorization = "Bearer " .. token }, function(status, body)
+        http.asyncGet(url, { Authorization = "Bearer " .. token }, function(status, body)
           if status ~= 200 then
             log.w("playlists page: status=" .. tostring(status))
             done(playlistsCache)
@@ -538,7 +602,7 @@ local function addToPlaylist(playlistId, trackId, callback)
     end
     local url = "https://api.spotify.com/v1/playlists/" .. playlistId .. "/items"
     local body = hs.json.encode({ uris = { "spotify:track:" .. trackId } })
-    hs.http.doAsyncRequest(
+    http.doAsyncRequest(
       url, "POST", body,
       { Authorization = "Bearer " .. token, ["Content-Type"] = "application/json" },
       function(status, response)
@@ -560,7 +624,7 @@ end
 -- deprecation), so fall back to scraping og:image off the public page.
 local function fetchImageViaScrape(id, onUrl)
   local url = "https://open.spotify.com/playlist/" .. id
-  hs.http.asyncGet(url, { ["User-Agent"] = "Mozilla/5.0" }, function(status, body)
+  http.asyncGet(url, { ["User-Agent"] = "Mozilla/5.0" }, function(status, body)
     if status ~= 200 or not body then onUrl(nil) return end
     local img = body:match('<meta property="og:image" content="([^"]+)"')
     onUrl(img and decodeEntities(img) or nil)
@@ -572,7 +636,7 @@ local function fetchPlaylistImage(token, uri, onUrl)
   if cached ~= nil then onUrl(cached or nil) return end
   local id = uri:match("^spotify:playlist:(.+)$")
   if not id then onUrl(nil) return end
-  hs.http.asyncGet(
+  http.asyncGet(
     "https://api.spotify.com/v1/playlists/" .. id .. "?fields=images",
     { Authorization = "Bearer " .. token },
     function(status, body)
@@ -597,6 +661,8 @@ end
 -- Play Playlist to mirror the app's Library "Recents" view. Names/covers come
 -- from the library cache when present, else a per-playlist lookup.
 local function fetchRecentlyPlayed(callback)
+  recentRequest = recentRequest + 1
+  local request = recentRequest
   callback = callback or function() end
   local now = hs.timer.secondsSinceEpoch()
   if recentlyPlayedCache and (now - recentlyPlayedFetchedAt) < RECENTLY_PLAYED_FRESH_SEC then
@@ -605,7 +671,7 @@ local function fetchRecentlyPlayed(callback)
   end
   ensureAccessToken(function(token)
     if not token then callback(nil) return end
-    hs.http.asyncGet(
+    http.asyncGet(
       "https://api.spotify.com/v1/me/player/recently-played?limit=50",
       { Authorization = "Bearer " .. token },
       function(status, body)
@@ -640,6 +706,7 @@ local function fetchRecentlyPlayed(callback)
           end
         end
         local function finish()
+          if request ~= recentRequest then return end
           recentlyPlayedCache = results
           recentlyPlayedFetchedAt = hs.timer.secondsSinceEpoch()
           callback(results)
@@ -679,7 +746,7 @@ local function setShuffle(state, cb)
   cb = cb or function() end
   ensureAccessToken(function(token)
     if not token then cb() return end
-    hs.http.doAsyncRequest(
+    http.doAsyncRequest(
       "https://api.spotify.com/v1/me/player/shuffle?state=" .. tostring(state),
       "PUT", "", { Authorization = "Bearer " .. token },
       function() cb() end
@@ -706,7 +773,7 @@ local function playContext(contextUri, mode)
         end
         local body = hs.json.encode({ context_uri = contextUri })
         local hdrs = { Authorization = "Bearer " .. token, ["Content-Type"] = "application/json" }
-        hs.http.doAsyncRequest(
+        http.doAsyncRequest(
           "https://api.spotify.com/v1/me/player/play", "PUT", body, hdrs,
           function(status, response)
             if status == 200 or status == 202 or status == 204 then
@@ -715,7 +782,7 @@ local function playContext(contextUri, mode)
             end
             if status == 404 and canRetry then
               hs.application.launchOrFocus("Spotify")
-              hs.timer.doAfter(1.5, function() attempt(false) end)
+              later(1.5, function() attempt(false) end)
               return
             end
             log.e("playContext " .. mode .. " failed: " .. tostring(status) .. " " .. tostring(response))
@@ -748,7 +815,7 @@ queueSmartTracks = function(contextUri)
   end
   ensureAccessToken(function(token)
     if not token then return end
-    hs.http.asyncGet(seedsUrl, { Authorization = "Bearer " .. token }, function(s, b)
+    http.asyncGet(seedsUrl, { Authorization = "Bearer " .. token }, function(s, b)
       if s ~= 200 then return end
       local d = hs.json.decode(b)
       local seeds = {}
@@ -766,7 +833,7 @@ queueSmartTracks = function(contextUri)
       end
       local pending, successes, queued = #batches, 0, {}
       for _, batch in ipairs(batches) do
-        hs.http.asyncGet(
+        http.asyncGet(
           "https://api.spotify.com/v1/recommendations?limit=" .. SMART_RECS_PER_CALL ..
             "&seed_tracks=" .. table.concat(batch, ","),
           { Authorization = "Bearer " .. token },
@@ -778,7 +845,7 @@ queueSmartTracks = function(contextUri)
               for _, t in ipairs((rd and rd.tracks) or {}) do
                 if t.uri and not queued[t.uri] then
                   queued[t.uri] = true
-                  hs.http.doAsyncRequest(
+                  http.doAsyncRequest(
                     "https://api.spotify.com/v1/me/player/queue?uri=" ..
                       hs.http.encodeForQuery(t.uri),
                     "POST", "", { Authorization = "Bearer " .. token },
@@ -818,20 +885,25 @@ local function setLiked(trackId, liked, verb)
     rateLimitAlert(verb, wait)
     return
   end
+  likedRequest = likedRequest + 1
+  local request = likedRequest
+  if trackId == currentTrackId then likedFetching = true end
   ensureAccessToken(function(token)
     if not token then
+      if request == likedRequest then likedFetching = false end
       hs.alert.show("Spotify: re-authenticate to " .. verb)
       return
     end
     local method = liked and "PUT" or "DELETE"
     -- Migrated alongside /contains: PUT/DELETE /v1/me/tracks → /v1/me/library.
     local uri = hs.http.encodeForQuery("spotify:track:" .. trackId)
-    hs.http.doAsyncRequest(
+    http.doAsyncRequest(
       "https://api.spotify.com/v1/me/library?uris=" .. uri,
       method,
       "",
       { Authorization = "Bearer " .. token, ["Content-Type"] = "application/json" },
       function(status, _, headers)
+        if request == likedRequest then likedFetching = false end
         if status == 429 then
           noteLibraryRateLimit(headers)
           rateLimitAlert(verb, libraryLockedFor() or 3600)
@@ -842,7 +914,7 @@ local function setLiked(trackId, liked, verb)
           hs.alert.show("Spotify: " .. verb .. " failed (" .. tostring(status) .. ")")
           return
         end
-        if trackId == currentTrackId and currentLiked ~= liked then
+        if request == likedRequest and trackId == currentTrackId and currentLiked ~= liked then
           currentLiked = liked
           notify()
         end
@@ -1057,6 +1129,7 @@ module.setup = setupWizard
 module.setupLabel = "Enable Spotify extras…"
 
 module.start = function(changeCallback)
+  invalidateWork()
   onChange = changeCallback
   poll.load()
   loadCreds()
@@ -1066,25 +1139,31 @@ module.start = function(changeCallback)
     -- Offer the guided setup once, ever (deferred so the pill renders first).
     -- The flag is set when shown, not on success, so declining doesn't re-prompt.
     if not hs.settings.get(OFFER_SETTING_KEY) then
-      hs.settings.set(OFFER_SETTING_KEY, true)
-      hs.timer.doAfter(1.5, setupWizard)
+      later(1.5, function()
+        hs.settings.set(OFFER_SETTING_KEY, true)
+        setupWizard()
+      end)
     end
     return
   end
-  hs.timer.doAfter(0.5, refresh)
+  later(0.5, refresh)
   -- fetchPlaylists is throttled by PLAYLISTS_FRESH_SEC, so this is a no-op
   -- when the just-loaded disk cache is still fresh; otherwise it refreshes.
-  hs.timer.doAfter(1.0, function() fetchPlaylists() end)
-  hs.timer.doAfter(1.5, function() fetchRecentlyPlayed() end)
+  later(1.0, function() fetchPlaylists() end)
+  later(1.5, function() fetchRecentlyPlayed() end)
 end
 
 module.stop = function()
+  invalidateWork()
+  invalidateSnapshot()
+  authorizationGeneration = authorizationGeneration + 1
   if authServer then authServer:stop() end
   if authServerTimer then authServerTimer:stop() end
+  if authExchangeTimer then authExchangeTimer:stop(); authExchangeTimer = nil end
   authServer, authServerTimer, onChange = nil, nil, nil
-  accessToken, accessExpiry = nil, 0
   currentUri, currentName = nil, nil
   currentTrackId, currentLiked, currentSmartShuffle = nil, nil, nil
+  likedFetching = false
   currentUserId, playlistsCache, playlistsFetching, playlistsFetchedAt = nil, nil, false, 0
   recentlyPlayedCache, recentlyPlayedFetchedAt = nil, 0
   -- nameCache intentionally preserved: pure URI→name mapping, safe to keep.
@@ -1097,7 +1176,10 @@ module.authenticate = function(clientId)
     hs.alert.show("Spotify auth: pass clientId on first call")
     return
   end
-  saveClientId(clientId)
+  authorizationGeneration = authorizationGeneration + 1
+  local authorization = authorizationGeneration
+  -- Keep the active credentials usable if the browser flow is cancelled or
+  -- fails. Replace their session only after a successful exchange.
 
   local verifier = b64url(urandom(48))
   local challenge = pkceChallenge(verifier)
@@ -1105,16 +1187,24 @@ module.authenticate = function(clientId)
 
   if authServer then authServer:stop() end
   if authServerTimer then authServerTimer:stop() end
+  if authExchangeTimer then authExchangeTimer:stop(); authExchangeTimer = nil end
   authServer = hs.httpserver.new(false, false)
   authServer:setName("spotify-auth")
   authServer:setPort(AUTH_PORT)
+  local exchanged = false
   authServer:setCallback(function(_method, path)
+    if authorization ~= authorizationGeneration or exchanged then
+      return "Authorization session expired.", 400, {}
+    end
     local code = path:match("[?&]code=([^&]+)")
     local recvState = path:match("[?&]state=([^&]+)")
     if not (code and recvState == state) then
       return "Authorization failed or state mismatch.", 400, {}
     end
-    hs.timer.doAfter(0.1, function()
+    exchanged = true
+    authExchangeTimer = hs.timer.doAfter(0.1, function()
+      if authorization ~= authorizationGeneration then return end
+      authExchangeTimer = nil
       local body = "client_id=" .. hs.http.encodeForQuery(clientId) ..
         "&grant_type=authorization_code" ..
         "&code=" .. hs.http.encodeForQuery(code) ..
@@ -1125,6 +1215,8 @@ module.authenticate = function(clientId)
         body,
         { ["Content-Type"] = "application/x-www-form-urlencoded" },
         function(status, response)
+          if authorization ~= authorizationGeneration then return end
+          if authServerTimer then authServerTimer:stop(); authServerTimer = nil end
           if authServer then
             authServer:stop()
             authServer = nil
@@ -1135,16 +1227,27 @@ module.authenticate = function(clientId)
             return
           end
           local data = hs.json.decode(response)
-          if not (data and data.refresh_token) then
-            hs.alert.show("Spotify auth: no refresh_token in response")
+          if not (data and data.refresh_token and data.access_token) then
+            hs.alert.show("Spotify auth: missing token in response")
             return
           end
+          invalidateWork()
+          authGeneration = authGeneration + 1
+          tokenFlight = singleFlight()
+          currentUserId, playlistsCache, playlistsFetchedAt = nil, nil, 0
+          recentlyPlayedCache, recentlyPlayedFetchedAt = nil, 0
+          currentUri, currentName, currentTrackId, currentLiked = nil, nil, nil, nil
+          saveClientId(clientId)
           saveRefreshToken(data.refresh_token)
           accessToken = data.access_token
           accessExpiry = hs.timer.secondsSinceEpoch() + (data.expires_in or 3600)
           log.i("auth saved; granted scope=" .. tostring(data.scope))
           hs.alert.show("Spotify auth saved")
-          hs.timer.doAfter(0.5, refresh)
+          if onChange then
+            later(0.5, refresh)
+            later(1.0, function() fetchPlaylists() end)
+            later(1.5, function() fetchRecentlyPlayed() end)
+          end
         end
       )
     end)
@@ -1153,6 +1256,9 @@ module.authenticate = function(clientId)
   authServer:start()
   -- If the user never completes the redirect, don't leave the server bound.
   authServerTimer = hs.timer.doAfter(120, function()
+    if authorization ~= authorizationGeneration then return end
+    authorizationGeneration = authorizationGeneration + 1
+    if authExchangeTimer then authExchangeTimer:stop(); authExchangeTimer = nil end
     if authServer then authServer:stop() end
     authServer, authServerTimer = nil, nil
   end)

@@ -246,3 +246,66 @@ t.test("rightclick: Refresh interval submenu checks current, flags short, persis
   end
   t.eq(interval, 5)
 end)
+
+t.test("rightclick: foreign media keeps metadata and library commands without relative controls", function()
+  local api = fakeApi()
+  api.supportsSourceToggle = true
+  api.getShowOtherSources = function() return true end
+  api.getPlaylists = function() return { { id = "p", uri = "p", owned = true } } end
+  local copied = false
+  local items = rightclick.build({ api = api, running = true, track = "Video", artist = "Creator",
+    canControl = false, canSeek = false, canLike = false, canAddToPlaylist = false,
+    copyCurrent = function() copied = true end, openOnYouTube = function() end,
+    menuIcon = function() return nil end,
+    scheduleRender = function() end,
+  })
+  local names = titles(items)
+  t.eq(names, { "Open Spotify", "-", "Copy “Song by Artist”", "Open on YouTube",
+    "-", "Play Liked Songs", "Play Playlist", "Show Other Sources", "-", "Refresh interval" })
+  items[3].fn()
+  t.eq(copied, true)
+end)
+
+t.test("rightclick: explicit library playback survives changed or foreign current media", function()
+  local calls = {}
+  local api = fakeApi()
+  api.getPlaylists = function() return { { id = "p", uri = "playlist:p", name = "Chosen" } } end
+  api.playContext = function(uri, mode) calls[#calls + 1] = { uri, mode } end
+  api.playLikedSongs = function(mode) calls[#calls + 1] = { "liked", mode } end
+  for _, controllable in ipairs({ true, false }) do
+    local items = rightclick.build({ api = api, running = true, canControl = controllable,
+      isCurrent = function() return false end, menuIcon = function() end,
+      scheduleRender = function() end })
+    for _, item in ipairs(items) do
+      if item.title == "Play Playlist" then item.menu[1].fn({ cmd = true }) end
+      if item.title == "Play Liked Songs" then item.fn({}) end
+    end
+  end
+  t.eq(calls, { { "liked", "play" }, { "playlist:p", "shuffle" },
+    { "liked", "play" }, { "playlist:p", "shuffle" } })
+end)
+
+t.test("rightclick: transport callbacks reject a menu snapshot after the track changes", function()
+  local current, calls = true, 0
+  local api = fakeApi()
+  api.next = function() calls = calls + 1 end
+  local items = rightclick.build({ api = api, running = true,
+    isCurrent = function() return current end, scheduleRender = function() end })
+  local nextItem
+  for _, item in ipairs(items) do if item.title == T.NEXT_LABEL then nextItem = item end end
+  nextItem.fn()
+  current = false
+  nextItem.fn()
+  t.eq(calls, 1)
+end)
+
+t.test("rightclick: selected playback entries deduplicate recents and library", function()
+  local entry = { id = "same", uri = "same" }
+  local selection = rightclick.selectEntries({ running = true, api = {
+    getRecentlyPlayed = function() return { entry, entry } end,
+    getPlaylists = function() return { entry, { id = "other", uri = "other" } } end,
+  } })
+  t.eq(#selection.play, 2)
+  t.eq(selection.play[1].id, "same")
+  t.eq(selection.play[2].id, "other")
+end)

@@ -63,6 +63,7 @@ t.test("applemusic: mrState builds a streaming state (no trackId/artPath)", func
     running = true, playing = true, track = "T", artist = "A",
     progress = 0.5, durMs = 100000, artUrl = nil, artPath = nil,
     trackId = nil, shuffle = true,
+    canControl = false, canSeek = false, canLike = false, canAddToPlaylist = false,
   })
 end)
 
@@ -91,13 +92,14 @@ t.test("applemusic: mrState maps empty title/artist to nil and rate 0 to paused"
   t.eq(s.shuffle, false)
 end)
 
-t.test("applemusic: mrState folds a foreign source into the artist line", function()
+t.test("applemusic: mrState preserves artist and exposes foreign source separately", function()
   hs.timer._now = 0
   local base = { title = "T", artist = "A", duration = 100, elapsed = 0, rate = 1 }
-  t.eq(T.mrState(base, false, nil, "Safari").artist, "A · via Safari")
+  t.eq(T.mrState(base, false, nil, "Safari").artist, "A")
+  t.eq(T.mrState(base, false, nil, "Safari").sourceName, "Safari")
   -- No artist: the label stands alone so the source is still clear.
   local noArtist = { title = "T", artist = "", duration = 100, elapsed = 0, rate = 1 }
-  t.eq(T.mrState(noArtist, false, nil, "Safari").artist, "via Safari")
+  t.eq(T.mrState(noArtist, false, nil, "Safari").artist, nil)
 end)
 
 -- ---------------------------------------------------------------------------
@@ -146,6 +148,8 @@ t.test("applemusic: runningState is a blank running shape carrying playing/shuff
     running = true, playing = true, track = nil, artist = nil,
     progress = 0, durMs = 0, artUrl = nil, artPath = nil,
     trackId = nil, shuffle = true,
+    sourceBundleId = "com.apple.Music", sourceName = "Music",
+    canControl = true, canSeek = false, canLike = false, canAddToPlaylist = false,
   })
 end)
 
@@ -249,6 +253,246 @@ local function resetStubs()
   hs.osascript._applescript = function(_) return false, nil end
   hs._exec = function(_) return "" end
 end
+
+-- Unlike the default synchronous task fake, this fixture lets completions land
+-- after stop, restart, transport actions, and a newer request.
+local function withDelayedTasks(fn)
+  local oldTask, oldAfter, oldItunes = hs.task.new, hs.timer.doAfter, hs.itunes
+  local tasks, timers, actions = {}, {}, {}
+  hs.task.new = function(_, callback)
+    local task = { callback = callback }
+    function task:start() return self end
+    function task:terminate() self.terminated = true end
+    tasks[#tasks + 1] = task
+    return task
+  end
+  hs.timer.doAfter = function(_, callback)
+    local timer = { callback = callback }
+    function timer:stop() self.stopped = true end
+    timers[#timers + 1] = timer
+    return timer
+  end
+  hs.itunes = setmetatable({}, { __index = function(_, action)
+    return function() actions[#actions + 1] = action end
+  end })
+  T.resetArtState()
+  am.setPollInterval(3)
+  hs.timer._now = 1000
+  hs.application._running.Music = true
+  hs.osascript._applescript = function(script)
+    if script:find("return shuffle enabled", 1, true) then return true, "false" end
+    return true, "FALLBACK\tplaying\tfalse\t-1728"
+  end
+  hs._exec = function()
+    return '{"title":"Song","artist":"A","duration":100,"elapsed":10,"rate":1,"bundleId":"com.apple.Music"}'
+  end
+  local ok, err = pcall(fn, tasks, timers, actions)
+  am.stop()
+  hs.task.new, hs.timer.doAfter, hs.itunes = oldTask, oldAfter, oldItunes
+  resetStubs()
+  if not ok then error(err, 0) end
+end
+
+t.test("applemusic: delayed MediaRemote reads obey interval and cancel stale transport results", function()
+  withDelayedTasks(function(tasks, _, actions)
+    am.getState()
+    hs.timer._now = 1002
+    am.getState()
+    t.eq(#tasks, 0)
+    hs.timer._now = 1003
+    am.getState()
+    t.eq(#tasks, 1)
+    am.next()
+    t.eq(actions, { "next" })
+    t.eq(tasks[1].terminated, true)
+    am.getState()
+    t.eq(#tasks, 2)
+    tasks[2].callback(0, '{"title":"New","bundleId":"com.apple.Music"}')
+    tasks[1].callback(0, '{"title":"Old","bundleId":"com.apple.Music"}')
+    t.eq(T.mrSnapshot().title, "New")
+  end)
+end)
+
+t.test("applemusic: stop cancels warmup and subprocess; old callbacks cannot replace restart state", function()
+  withDelayedTasks(function(tasks, timers)
+    am.start(function() end)
+    am.getState()
+    hs.timer._now = 1003
+    am.getState()
+    am.stop()
+    t.eq(tasks[1].terminated, true)
+    t.eq(timers[1].stopped, true)
+    am.start(function() end)
+    am.getState()
+    timers[1].callback()
+    t.eq(am.getPlaylists(), nil)
+    tasks[1].callback(0, '{"title":"Stale"}')
+    t.eq(T.mrSnapshot().title, "Song")
+  end)
+end)
+
+t.test("applemusic: same-title artist change re-probes library path", function()
+  withDelayedTasks(function(tasks)
+    am.getState()
+    hs.timer._now = 1003
+    am.getState()
+    tasks[1].callback(0, '{"title":"Song","artist":"B","bundleId":"com.apple.Music"}')
+    t.eq(am.getState().artist, "B")
+    local probes = 0
+    hs.osascript._applescript = function()
+      probes = probes + 1
+      return true, "FALLBACK\tplaying\tfalse\t-1728"
+    end
+    am.getState()
+    t.eq(probes, 1)
+  end)
+end)
+
+t.test("applemusic: foreign and unknown sources cannot send Music transport", function()
+  withDelayedTasks(function(_, _, actions)
+    am.setShowOtherSources(true)
+    hs._exec = function()
+      return '{"title":"Browser song","artist":"Artist","bundleId":"com.apple.Safari","appName":"Safari"}'
+    end
+    local state = am.getState()
+    t.eq(state.sourceBundleId, "com.apple.Safari")
+    t.eq(state.sourceName, "Safari")
+    t.eq(state.artist, "Artist")
+    t.eq(state.canControl, false)
+    t.eq(state.canSeek, false)
+    am.next(); am.playpause(); am.setPosition(4)
+    t.eq(actions, {})
+    T.resetArtState()
+    hs._exec = function() return '{"title":"Unknown"}' end
+    t.eq(am.getState().canControl, false)
+    am.next()
+    t.eq(actions, {})
+  end)
+end)
+
+t.test("applemusic: hidden foreign sources retain displayed Music transport", function()
+  withDelayedTasks(function(_, _, actions)
+    for _, bundle in ipairs({ "com.apple.Safari", "com.spotify.client" }) do
+      T.resetArtState()
+      hs._exec = function()
+        return '{"title":"Hidden song","bundleId":"' .. bundle .. '"}'
+      end
+      local state = am.getState()
+      t.eq(state.track, nil)
+      t.eq(state.sourceBundleId, "com.apple.Music")
+      t.eq(state.canControl, true)
+      am.playpause()
+    end
+    t.eq(actions, { "playpause", "playpause" })
+  end)
+end)
+
+t.test("applemusic: captured library and playlist IDs drive menu actions", function()
+  T.resetArtState()
+  local scripts = {}
+  hs.osascript._applescript = function(script)
+    scripts[#scripts + 1] = script
+    return true, "OK"
+  end
+  am.like(123)
+  am.unlike(456)
+  local added
+  am.addToPlaylist("PLAYLIST2", 789, function(ok) added = ok end)
+  am.playContext("applemusic:playlist:PLAYLIST2", "shuffle")
+  t.ok(scripts[1]:find("database ID is 123", 1, true))
+  t.ok(scripts[2]:find("database ID is 456", 1, true))
+  t.ok(scripts[3]:find("database ID is 789", 1, true))
+  t.ok(scripts[3]:find('persistent ID is "PLAYLIST2"', 1, true))
+  t.ok(scripts[4]:find('persistent ID is "PLAYLIST2"', 1, true))
+  t.eq(added, true)
+  for _, script in ipairs(scripts) do t.eq(script:find("current track", 1, true), nil) end
+  resetStubs()
+end)
+
+t.test("applemusic: subscription playlist fallback preserves selected object and persistent identity", function()
+  local calls, added = 0, nil
+  hs.osascript._applescript = function(script)
+    calls = calls + 1
+    if calls == 1 then
+      t.ok(script:find("database ID is 789", 1, true))
+      return true, "ERROR: Can only duplicate subscription tracks to library source"
+    end
+    t.ok(script:find("set selectedTrack to (first track of library playlist 1 whose database ID is 789)", 1, true))
+    t.ok(script:find('set selectedPlaylist to (first user playlist whose persistent ID is "PLAYLIST2")', 1, true))
+    t.ok(script:find('set importedTrack to duplicate selectedTrack to source "Library"', 1, true))
+    t.ok(script:find("persistent ID is selectedPersistentID", 1, true))
+    t.ok(script:find("duplicate importedTrack to selectedPlaylist", 1, true))
+    t.eq(script:find("current track", 1, true), nil)
+    t.eq(script:find("whose name", 1, true), nil)
+    return true, "OK"
+  end
+  am.addToPlaylist("PLAYLIST2", 789, function(ok) added = ok end)
+  t.eq(added, true)
+  t.eq(calls, 2)
+  resetStubs()
+end)
+
+t.test("applemusic: unresolved subscription identity reports failure without a name-based retry", function()
+  local calls, added = 0, nil
+  hs.osascript._applescript = function(script)
+    calls = calls + 1
+    t.eq(script:find("current track", 1, true), nil)
+    t.eq(script:find("whose name", 1, true), nil)
+    return true, "ERROR: Can't get track with the captured identity"
+  end
+  am.addToPlaylist("PLAYLIST2", 789, function(ok) added = ok end)
+  t.eq(added, false)
+  t.eq(calls, 2)
+  resetStubs()
+end)
+
+t.test("applemusic: failed subprocess construction and start do not wedge refresh", function()
+  local platform = t.loadModule("backends/applemusic/platform.lua")
+  local original = hs.task.new
+  local ok, err = pcall(function()
+    hs.task.new = function() return nil end
+    t.eq(platform.readAsync(function() error("unexpected completion") end), false)
+    hs.task.new = function() return { start = function() return false end } end
+    t.eq(platform.readAsync(function() error("unexpected completion") end), false)
+    local calls = 0
+    hs.task.new = original
+    hs._exec = function() return '{"title":"Recovered"}' end
+    t.eq(platform.readAsync(function(snapshot)
+      calls = calls + 1
+      t.eq(snapshot.title, "Recovered")
+    end), true)
+    t.eq(calls, 1)
+  end)
+  hs.task.new = original
+  platform.stop()
+  resetStubs()
+  if not ok then error(err, 0) end
+end)
+
+t.test("applemusic: library tracks with the same title refresh context by database ID", function()
+  T.resetArtState()
+  hs.application._running.Music = true
+  hs.timer._now = 1000
+  local id, nameReads = 10, 0
+  hs.osascript._applescript = function(script)
+    if script:find("set s to player state", 1, true) then
+      return true, "OK\tplaying\tfalse\tSame title\tArtist\t" .. id .. "\t100\t10\tfalse"
+    end
+    if script:find("return name of current playlist", 1, true) then
+      nameReads = nameReads + 1
+      return true, "Playlist " .. id
+    end
+    return true, "ERROR"
+  end
+  am.getState()
+  t.eq(am.getName(), "Playlist 10")
+  id = 11
+  hs.timer._now = 1003
+  am.getState()
+  t.eq(am.getName(), "Playlist 11")
+  t.eq(nameReads, 2)
+  resetStubs()
+end)
 
 -- ---------------------------------------------------------------------------
 -- getState: Music not running
@@ -510,6 +754,7 @@ t.test("applemusic: getState mr-path track change resets cachedPath and re-probe
 
   -- Second getState: "mr" path, async task fires with title "B" -> title changed
   -- -> cachedPath reset to nil. Third getState then re-probes MUSIC_QUERY.
+  hs.timer._now = hs.timer._now + am.getPollInterval()
   am.getState()
   local callsBeforeThird = musicQueryCalls
   am.getState()

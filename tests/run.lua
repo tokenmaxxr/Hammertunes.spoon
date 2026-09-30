@@ -15,5 +15,6 @@ require("interface_spec")
 require("init_spec")
 require("menubar_spec")
 require("rightclick_spec")
+require("images_spec")
 
 os.exit(t.report())

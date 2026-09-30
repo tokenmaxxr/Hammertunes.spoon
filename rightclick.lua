@@ -18,6 +18,32 @@ local module = {}
 
 local MENU_PLAYLIST_LIMIT = 25
 
+-- This is also used by the controller to warm exactly the visible icons.
+module.selectEntries = function(ctx)
+  local api = ctx.api
+  local playlists = api and api.getPlaylists() or {}
+  local owned, play, seen = {}, {}, {}
+  if api and ctx.trackId and ctx.canAddToPlaylist ~= false then
+    for _, p in ipairs(playlists) do
+      if p.owned and #owned < MENU_PLAYLIST_LIMIT then owned[#owned + 1] = p end
+    end
+  end
+  if ctx.running then
+    local function add(entries)
+      for _, p in ipairs(entries) do
+        local key = p.id or p.uri
+        if key and not seen[key] and #play < MENU_PLAYLIST_LIMIT then
+          seen[key] = true
+          play[#play + 1] = p
+        end
+      end
+    end
+    add(api and api.getRecentlyPlayed() or {})
+    add(playlists)
+  end
+  return { owned = owned, play = play }
+end
+
 -- Modifier → playback mode for the "Play" items.
 -- ⌘⌥ click = smart shuffle, ⌘ click = shuffle, plain = play.
 local function playMode(mods)
@@ -35,12 +61,20 @@ end
 
 local SHUFFLE_LABELS = { off = "Shuffle: Off", on = "Shuffle: On", smart = "Shuffle: Smart" }
 
+-- Relative controls must still refer to the media displayed when the menu
+-- opened. Explicit playlist commands name their target and need no such guard.
+local function currentAction(ctx, callback)
+  return function(...)
+    if not ctx.isCurrent or ctx.isCurrent() then return callback(...) end
+  end
+end
+
 local function shuffleMenuItems(ctx, st)
   local items = {
     { title = "Off", checked = st == "off",
-      fn = function() ctx.api.setShuffling(false); ctx.scheduleRender() end },
+      fn = currentAction(ctx, function() ctx.api.setShuffling(false); ctx.scheduleRender() end) },
     { title = "Shuffle", checked = st == "on",
-      fn = function() ctx.api.setShuffling(true); ctx.scheduleRender() end },
+      fn = currentAction(ctx, function() ctx.api.setShuffling(true); ctx.scheduleRender() end) },
   }
   -- Smart Shuffle: the API can read it but not set it, so show it disabled
   -- (checked only when active). Gated on backend capability.
@@ -93,25 +127,26 @@ local function seekLabel(ctx)
 end
 
 local function transportGroup(ctx)
-  if not (ctx.running and ctx.api) then return {} end
+  if not (ctx.running and ctx.api) or ctx.canControl == false then return {} end
   local api = ctx.api
   local items = {
     { title = "-" },
-    { title = PREV_LABEL, fn = function() api.previous(); ctx.scheduleRender() end },
+    { title = PREV_LABEL, fn = currentAction(ctx, function() api.previous(); ctx.scheduleRender() end) },
     { title = playPauseLabel(ctx.playing),
-      fn = function() api.playpause(); ctx.scheduleRender() end },
+      fn = currentAction(ctx, function() api.playpause(); ctx.scheduleRender() end) },
   }
   -- Seek sits between Play/Pause and Next, next to the playback controls it acts on.
-  if ctx.seekRatio and ctx.seek and ctx.durMs and ctx.durMs > 0 then
+  if ctx.canSeek ~= false and ctx.seekRatio and ctx.seek and ctx.durMs and ctx.durMs > 0 then
     local ratio = ctx.seekRatio
-    items[#items + 1] = { title = seekLabel(ctx), fn = function() ctx.seek(ratio) end }
+    items[#items + 1] = { title = seekLabel(ctx), fn = currentAction(ctx, function() ctx.seek(ratio) end) }
   end
-  items[#items + 1] = { title = NEXT_LABEL, fn = function() api.next(); ctx.scheduleRender() end }
+  items[#items + 1] = { title = NEXT_LABEL,
+    fn = currentAction(ctx, function() api.next(); ctx.scheduleRender() end) }
   return items
 end
 
--- Refresh-interval picker: how often the backend runs its expensive AppleScript
--- now-playing read. Shared across backends (see backends/pollinterval.lua).
+-- Refresh-interval picker: how often the backend runs expensive now-playing
+-- reads. Shared across backends (see backends/pollinterval.lua).
 -- Shorter polls more often — flagged as higher battery, with an alert on select.
 local POLL_INTERVAL_CHOICES = { 1, 2, 3, 5, 10 }
 local POLL_INTERVAL_DEFAULT = 3 -- also the battery-warning threshold: options below it poll more
@@ -139,21 +174,22 @@ local function pollIntervalMenuItems(ctx)
   return items
 end
 
--- Now-playing track group: like/unlike, copy, YouTube, Add to Playlist. Only
--- when a track is identified (needs the api and a trackId).
-local function trackGroup(ctx, playlists)
+-- Metadata actions need only a title; library actions also require an ID and
+-- the corresponding backend capability.
+local function trackGroup(ctx, selection)
   local api = ctx.api
-  if not (api and ctx.trackId) then return {} end
+  if not (ctx.track or (api and ctx.trackId)) then return {} end
   local items = { { title = "-" } }
   local trackId = ctx.trackId
-  local liked = api.getLiked()
-  -- nil happens during the auth/first-fetch race; default to Like and kick off
-  -- a refresh so the next open shows the right verb.
-  if liked == true then
-    items[#items + 1] = { title = "Unlike", fn = function() api.unlike(trackId); ctx.scheduleRender() end }
-  else
-    if liked == nil then api.refreshLiked(trackId) end
-    items[#items + 1] = { title = "Like", fn = function() api.like(trackId); ctx.scheduleRender() end }
+  if api and trackId and ctx.canLike ~= false then
+    local liked = api.getLiked()
+    -- nil happens during the auth/first-fetch race; refresh for the next open.
+    if liked == true then
+      items[#items + 1] = { title = "Unlike", fn = function() api.unlike(trackId); ctx.scheduleRender() end }
+    else
+      if liked == nil then api.refreshLiked(trackId) end
+      items[#items + 1] = { title = "Like", fn = function() api.like(trackId); ctx.scheduleRender() end }
+    end
   end
   -- Same "Song by Artist" copy as a double-click on the pill's middle, surfaced
   -- in the menu for discoverability. Gated on artist so it never copies a bare
@@ -166,20 +202,17 @@ local function trackGroup(ctx, playlists)
   end
   -- Add to Playlist: only playlists you own — you can't add tracks to ones you
   -- merely follow.
-  local owned = {}
-  for _, p in ipairs(playlists) do
-    if p.owned then owned[#owned + 1] = p end
-  end
+  local owned = selection.owned
   if #owned > 0 then
     local subItems = {}
     for _, p in ipairs(owned) do
-      if #subItems >= MENU_PLAYLIST_LIMIT then break end
       local pid, pname = p.id, p.name
       subItems[#subItems + 1] = {
         title = pname,
         image = ctx.menuIcon(p.imageUrl),
         fn = function()
           api.addToPlaylist(pid, trackId, function(ok)
+            if ctx.isActive and not ctx.isActive() then return end
             hs.alert.show(ok and ("Added to " .. pname) or ("Failed to add to " .. pname))
           end)
         end,
@@ -187,7 +220,7 @@ local function trackGroup(ctx, playlists)
     end
     items[#items + 1] = { title = "Add to Playlist", menu = subItems }
   end
-  return items
+  return #items > 1 and items or {}
 end
 
 -- Playback group: Shuffle + Play items. Only when the player is running — on a
@@ -195,7 +228,7 @@ end
 -- Switch; starting playback would need the app launched first, so this stays
 -- hidden (even when the backend still has playlists/liked-songs cached from its
 -- last run) until it's running again.
-local function playbackGroup(ctx, playlists)
+local function playbackGroup(ctx, selection)
   if not ctx.running then return {} end
   local api = ctx.api
   -- Play Playlist: recently-played pinned on top in recency order (this is where
@@ -203,11 +236,7 @@ local function playbackGroup(ctx, playlists)
   -- the rest of the library, deduped by id.
   local playItems = {}
   if api then
-    local recent = api.getRecentlyPlayed() or {}
-    local pinned = {}
-    for _, r in ipairs(recent) do
-      if #playItems >= MENU_PLAYLIST_LIMIT then break end
-      pinned[r.id] = true
+    for _, r in ipairs(selection.play) do
       local ruri = r.uri
       playItems[#playItems + 1] = {
         title = r.name or r.uri,
@@ -215,23 +244,14 @@ local function playbackGroup(ctx, playlists)
         fn = function(mods) api.playContext(ruri, playMode(mods)) end,
       }
     end
-    for _, p in ipairs(playlists) do
-      if #playItems >= MENU_PLAYLIST_LIMIT then break end
-      if not pinned[p.id] then
-        local puri = p.uri
-        playItems[#playItems + 1] = {
-          title = p.name,
-          image = ctx.menuIcon(p.imageUrl),
-          fn = function(mods) api.playContext(puri, playMode(mods)) end,
-        }
-      end
-    end
   end
-  -- Shuffle always leads the group, so this separator is never left dangling.
-  -- It works at the transport level (no api needed); everything below does.
+  -- Shuffle changes the current session; library commands explicitly choose
+  -- what to play, including when the pill displays another app's metadata.
   local items = { { title = "-" } }
-  local st = shuffleState(ctx)
-  items[#items + 1] = { title = SHUFFLE_LABELS[st], menu = shuffleMenuItems(ctx, st) }
+  if ctx.canControl ~= false then
+    local st = shuffleState(ctx)
+    items[#items + 1] = { title = SHUFFLE_LABELS[st], menu = shuffleMenuItems(ctx, st) }
+  end
   if api then
     if api.playLikedSongs then
       items[#items + 1] = { title = "Play Liked Songs", fn = function(mods) api.playLikedSongs(playMode(mods)) end }
@@ -250,7 +270,7 @@ local function playbackGroup(ctx, playlists)
       }
     end
   end
-  return items
+  return #items > 1 and items or {}
 end
 
 -- Update notice (spoon.checkForUpdates, on by default): only when the
@@ -285,7 +305,7 @@ local function accountGroup(ctx)
     -- popupMenu is still blocking.
     items[#items + 1] = {
       title = api.setupLabel or "Enable extras…",
-      fn = function() hs.timer.doAfter(0, function() api.setup() end) end,
+      fn = function() (ctx.defer or hs.timer.doAfter)(0, function() api.setup() end) end,
     }
   elseif showReauth then
     items[#items + 1] = { title = "Re-authenticate", fn = function() api.authenticate() end }
@@ -300,18 +320,17 @@ local function accountGroup(ctx)
 end
 
 module.build = function(ctx)
-  local api = ctx.api
   -- One read of the cached playlist list, shared by the track group (Add to
   -- Playlist) and the playback group (Play Playlist).
-  local playlists = (api and api.getPlaylists()) or {}
+  local selection = module.selectEntries(ctx)
   local items = {}
   local function append(section)
     for _, it in ipairs(section) do items[#items + 1] = it end
   end
   append(appHeader(ctx))
   append(transportGroup(ctx))
-  append(trackGroup(ctx, playlists))
-  append(playbackGroup(ctx, playlists))
+  append(trackGroup(ctx, selection))
+  append(playbackGroup(ctx, selection))
   append(updateGroup(ctx))
   append(accountGroup(ctx))
   return items

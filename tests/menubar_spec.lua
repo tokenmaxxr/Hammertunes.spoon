@@ -41,6 +41,8 @@ local function withGestures(fn)
   function menu:setTitle() end
   function menu:setTooltip() end
   function menu:setClickCallback(callback) self.click = callback end
+  function menu:setMenu(items) self.items = items end
+  function menu:popupMenu() end
   function menu:delete() end
   hs = {
     logger = savedHs.logger,
@@ -74,23 +76,30 @@ local function withGestures(fn)
     alert = { show = function() end },
   }
   local subject
+  local state = { running = true, playing = true, track = "Song", artist = "Artist",
+    trackId = "song", durMs = 200000, progress = 0.1 }
+  local renderCount = 0
+  local menuContext
   local ok, err = pcall(function()
     subject = t.loadModule("menubar.lua")
     local noop = function() end
     subject.start({
-      pill = { new = function() return { update = noop } end },
+      pill = { new = function() return { update = function() renderCount = renderCount + 1 end } end },
       images = { newCache = function()
         return { getPath = noop, getUrl = noop, reset = noop }
       end },
-      rightclick = { build = function() return {} end },
+      rightclick = { build = function(ctx) menuContext = ctx; return {} end,
+        selectEntries = function() return { owned = {}, play = {} } end },
       api = {
         appName = "Test player",
         getState = function()
-          return { running = true, playing = true, track = "Song", artist = "Artist",
-            trackId = "song", durMs = 200000, progress = 0.1 }
+          local snapshot = {}
+          for k, v in pairs(state) do snapshot[k] = v end
+          return snapshot
         end,
         getPlaylists = noop, getRecentlyPlayed = noop, getUri = noop,
         getName = noop, getLiked = noop, refresh = noop, refreshLiked = noop,
+        refreshPlaylists = noop, refreshRecentlyPlayed = noop,
         start = noop, stop = noop,
         getPosition = function() return 10 end,
         setPosition = function(value) record("seek", value) end,
@@ -100,7 +109,9 @@ local function withGestures(fn)
         next = function() record("next") end,
       },
     })
-    local harness = { calls = calls, stop = subject.stop }
+    local harness = { calls = calls, stop = subject.stop, state = state,
+      renders = function() return renderCount end, timers = timers,
+      menuContext = function() return menuContext end }
     function harness.advance(seconds)
       local target = now + seconds
       while true do
@@ -221,5 +232,68 @@ t.test("menubar: stop cancels an outstanding hold", function()
     h.stop()
     h.advance(2)
     t.eq(h.calls, {})
+  end)
+end)
+
+t.test("menubar: queued release and stale timer callbacks cannot act after stop", function()
+  withGestures(function(h)
+    h.event("leftMouseDown", 190)
+    h.event("leftMouseUp", 190)
+    local count = h.renders()
+    h.stop()
+    -- Simulate already-dispatched callbacks, even though stop cancelled timers.
+    for _, timer in ipairs(h.timers) do timer.callback() end
+    t.eq(h.calls, {})
+    t.eq(h.renders(), count)
+  end)
+end)
+
+t.test("menubar: changed track cancels pending play-pause and hold seek", function()
+  withGestures(function(h)
+    h.event("leftMouseDown", 150)
+    h.event("leftMouseUp", 150)
+    h.advance(0)
+    h.state.trackId = "next"
+    h.advance(0.3)
+    t.eq(h.calls, {})
+    h.advance(0.7)
+    h.event("leftMouseDown", 175)
+    h.state.trackId = "another"
+    h.advance(1)
+    t.eq(h.calls, {})
+  end)
+end)
+
+t.test("menubar: read-only source suppresses transport but permits double-click copy", function()
+  withGestures(function(h)
+    h.state.canControl, h.state.canSeek = false, false
+    h.advance(1)
+    h.event("leftMouseDown", 175)
+    h.advance(1)
+    h.event("leftMouseUp", 175)
+    for _ = 1, 2 do
+      h.event("leftMouseDown", 150)
+      h.event("leftMouseUp", 150)
+      h.advance(0.05)
+    end
+    h.advance(0.5)
+    t.eq(h.calls, { { "copy", "Song by Artist" } })
+  end)
+end)
+
+t.test("menubar: menu seek rejects new media while copy retains displayed metadata", function()
+  withGestures(function(h)
+    h.event("rightMouseDown", 175)
+    h.advance(0)
+    local ctx = h.menuContext()
+    t.ok(ctx)
+    ctx.seek(0.75)
+    t.eq(h.calls, { { "seek", 150 } })
+    h.state.trackId, h.state.track, h.state.artist = "new", "New song", "New artist"
+    h.state.durMs = 100000
+    h.advance(1)
+    ctx.seek(0.75)
+    ctx.copyCurrent()
+    t.eq(h.calls, { { "seek", 150 }, { "copy", "Song by Artist" } })
   end)
 end)

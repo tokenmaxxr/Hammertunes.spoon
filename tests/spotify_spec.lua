@@ -4,6 +4,234 @@ local parse = spotify._test.parseSpotifyState
 local parseRetryAfter = spotify._test.parseRetryAfter
 local singleFlight = spotify._test.singleFlight
 
+-- Delayed network completions exercise real public backend operations. No
+-- credentials or playlist caches are read from the developer's machine.
+local function withNetwork(body)
+  local previous, open = hs, io.open
+  local requests, timers, writes = {}, {}, {}
+  local fake = setmetatable({}, { __index = previous })
+  fake.timer = {
+    secondsSinceEpoch = function() return 10000 end,
+    doAfter = function(_, callback)
+      local timer = { callback = callback, stop = function(self) self.stopped = true end }
+      timers[#timers + 1] = timer
+      return timer
+    end,
+  }
+  fake.execute = function(command)
+    if command:find("add%-generic%-password") then
+      writes[#writes + 1] = command
+      return "", true
+    end
+    return "credential", true
+  end
+  fake.json = { decode = function(value) return value end, encode = function() return "{}" end }
+  fake.alert = { show = function() end }
+  fake.http = { encodeForQuery = function(value) return value end }
+  for _, method in ipairs({ "asyncGet", "asyncPost", "doAsyncRequest" }) do
+    fake.http[method] = function(...)
+      local args = table.pack(...)
+      requests[#requests + 1] = { url = args[1], callback = args[args.n], method = method }
+    end
+  end
+  io.open = function(path, ...)
+    if path:find(".hammertunes-playlists.json", 1, true) then return nil end
+    return open(path, ...)
+  end
+  hs = fake
+  local backend = t.loadModule("backends/spotify.lua")
+  local ok, err = pcall(body, backend, requests, timers, writes, fake)
+  hs, io.open = previous, open
+  if not ok then error(err, 2) end
+end
+
+t.test("spotify: stopping cancels startup work and ignores already queued timers", function()
+  withNetwork(function(backend, requests, timers)
+    backend.start(function() end)
+    t.eq(#timers, 3)
+    backend.stop()
+    for _, timer in ipairs(timers) do
+      t.eq(timer.stopped, true)
+      timer.callback()
+    end
+    t.eq(#requests, 0)
+  end)
+end)
+
+t.test("spotify: token rotation survives stop but pending commands do not", function()
+  withNetwork(function(backend, requests, _, writes)
+    backend.playContext("spotify:playlist:test")
+    t.eq(#requests, 1)
+    backend.stop()
+    requests[1].callback(200, { access_token = "access", refresh_token = "rotated" })
+    t.eq(#writes, 1)
+    t.ok(writes[1]:find("rotated", 1, true))
+    t.eq(#requests, 1)
+    backend.start(function() end)
+    backend.refresh()
+    t.eq(requests[2].url, "https://api.spotify.com/v1/me/player")
+  end)
+end)
+
+t.test("spotify: late player and name responses cannot replace newer context", function()
+  withNetwork(function(backend, requests)
+    backend.refresh()
+    requests[1].callback(200, { access_token = "access" })
+    backend.refresh()
+    requests[3].callback(200, { context = { uri = "spotify:playlist:B" } })
+    requests[2].callback(200, { context = { uri = "spotify:playlist:A" } })
+    t.eq(backend.getUri(), "spotify:playlist:B")
+    backend.refresh()
+    requests[5].callback(200, { context = { type = "collection", uri = "spotify:collection" } })
+    requests[4].callback(200, { name = "Old playlist" })
+    t.eq(backend.getName(), "Liked Songs")
+    backend.stop()
+    backend.start(function() end)
+    requests[3].callback(200, { context = { uri = "spotify:playlist:B" } })
+    t.eq(backend.getUri(), nil)
+  end)
+end)
+
+t.test("spotify: returning to a track rejects its earlier liked response", function()
+  withNetwork(function(backend, requests)
+    backend.refreshLiked("A")
+    requests[1].callback(200, { access_token = "access" })
+    backend.refreshLiked("B")
+    backend.refreshLiked("A")
+    requests[4].callback(200, { true })
+    requests[2].callback(200, { false })
+    t.eq(backend.getLiked(), true)
+  end)
+end)
+
+t.test("spotify: repeated renders share the pending liked check", function()
+  withNetwork(function(backend, requests)
+    backend.refreshLiked("A")
+    backend.refreshLiked("A")
+    requests[1].callback(200, { access_token = "access" })
+    backend.refreshLiked("A")
+    t.eq(#requests, 2)
+    requests[2].callback(200, { true })
+    t.eq(backend.getLiked(), true)
+  end)
+end)
+
+t.test("spotify: stopped playlist pagination cannot refill cache", function()
+  withNetwork(function(backend, requests)
+    backend.refreshPlaylists()
+    requests[1].callback(200, { access_token = "access" })
+    requests[2].callback(200, { id = "user" })
+    backend.stop()
+    backend.start(function() end)
+    requests[3].callback(200, { items = {}, next = "https://api.spotify.com/next" })
+    t.eq(#requests, 3)
+    t.eq(backend.getPlaylists(), nil)
+  end)
+end)
+
+t.test("spotify: newer recently-played responses win over older responses", function()
+  withNetwork(function(backend, requests)
+    backend.refreshRecentlyPlayed()
+    requests[1].callback(200, { access_token = "access" })
+    backend.refreshRecentlyPlayed()
+    requests[3].callback(200, { items = {} })
+    local current = backend.getRecentlyPlayed()
+    requests[2].callback(200, { items = {} })
+    t.ok(current == backend.getRecentlyPlayed(), "older request must not replace the cache")
+  end)
+end)
+
+local function authHarness(fake)
+    local servers, authUrl, nonce = {}, nil, 0
+    fake.base64 = { encode = function() nonce = nonce + 1; return "nonce" .. nonce end }
+    fake.hash = { SHA256 = function() return "ab" end }
+    fake.urlevent = { openURL = function(url) authUrl = url end }
+    fake.httpserver = { new = function()
+      local server = {
+        setName = function() end, setPort = function() end, start = function() end,
+        stop = function(self) self.stopped = true end,
+        setCallback = function(self, cb) self.callback = cb end,
+      }
+      servers[#servers + 1] = server
+      return server
+    end }
+    return servers, function(backend)
+      backend.authenticate("client")
+      local server, state = servers[#servers], authUrl:match("&state=([^&]+)")
+      return function() return server.callback("GET", "/callback?code=code&state=" .. state) end
+    end
+end
+
+t.test("spotify: superseded refresh and authorization cannot replace new credentials", function()
+  withNetwork(function(backend, requests, timers, writes, fake)
+    local servers, begin = authHarness(fake)
+    local function authorize()
+      begin(backend)()
+      timers[#timers].callback()
+    end
+    backend.refresh() -- older refresh, still pending when the first login starts
+    authorize()
+    authorize()
+    local before = #writes
+    requests[2].callback(200, { access_token = "older", refresh_token = "older" })
+    t.eq(#writes, before)
+    t.eq(servers[2].stopped, nil, "old authorization cannot close the new server")
+    requests[3].callback(200, { access_token = "new", refresh_token = "new" })
+    requests[1].callback(200, { access_token = "old", refresh_token = "old" })
+    t.eq(#writes, before + 2)
+    t.ok(writes[#writes]:find("'new'", 1, true))
+    t.eq(servers[2].stopped, true)
+  end)
+end)
+
+t.test("spotify: authorization started before backend start accepts its redirect", function()
+  withNetwork(function(backend, requests, timers, writes, fake)
+    local _, begin = authHarness(fake)
+    local redirect = begin(backend)
+    backend.start(function() end)
+    local _, status = redirect()
+    t.eq(status, 200)
+    local exchange = timers[#timers]
+    backend.start(function() end) -- a queued exchange also survives UI startup
+    t.eq(exchange.stopped, nil)
+    exchange.callback()
+    requests[1].callback(200, { access_token = "new", refresh_token = "new" })
+    t.eq(#writes, 2)
+  end)
+end)
+
+t.test("spotify: cancelled and failed reauthorization preserve active credentials", function()
+  withNetwork(function(backend, requests, timers, writes, fake)
+    local _, begin = authHarness(fake)
+    backend.refresh()
+    requests[1].callback(200, { access_token = "existing" })
+    local redirect = begin(backend)
+    timers[#timers].callback() -- browser timeout/cancellation
+    local _, status = redirect()
+    t.eq(status, 400)
+    backend.refresh()
+    t.eq(requests[3].url, "https://api.spotify.com/v1/me/player")
+    begin(backend)()
+    timers[#timers].callback()
+    requests[4].callback(400, {})
+    backend.refresh()
+    t.eq(requests[5].url, "https://api.spotify.com/v1/me/player")
+    t.eq(#writes, 0, "failed login must not replace the stored client ID or token")
+  end)
+end)
+
+t.test("spotify: explicit stop rejects a pending authorization redirect", function()
+  withNetwork(function(backend, requests, _, _, fake)
+    local _, begin = authHarness(fake)
+    local redirect = begin(backend)
+    backend.stop()
+    backend.start(function() end)
+    local _, status = redirect()
+    t.eq(status, 400)
+    t.eq(#requests, 0)
+  end)
+end)
+
 -- Build a SPOTIFY_QUERY result line from its 8 tab-separated fields.
 local function line(state, track, artist, pos, dur, art, uri, shuffle)
   return table.concat({ state, track, artist, pos, dur, art, uri, shuffle }, "\t")

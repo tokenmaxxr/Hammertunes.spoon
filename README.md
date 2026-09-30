@@ -9,8 +9,9 @@ A menubar **pill** for [Hammerspoon](https://www.hammerspoon.org/) that shows
 what's playing and lets you control it - artwork, a live progress bar,
 press-and-hold scrubbing, click-zone transport, and a rich right-click menu.
 
-It works with **Spotify** or **Apple Music** (beta - basics tested). Most
-people use one or the other, so the setup below is split into two
+It works with **Spotify**, which is well tested, or **Apple Music**, which is
+in beta with only basic functionality tested so far. Most people use one or
+the other, so the setup below is split into two
 self-contained guides - **jump straight to [Spotify](#-spotify) or
 [Apple Music](#-apple-music-beta)** and follow only that one.
 
@@ -246,8 +247,13 @@ That's it - no auth step. (Equivalent: `spoon.Hammertunes:setBackend("applemusic
 - **Play Playlist** - your library playlists (no cover thumbnails).
 - **Show Other Sources** - mirror Now Playing from browsers and other apps
   (MediaRemote is system-wide); off by default, and Spotify is always excluded.
+  These sources are display-only: copy and YouTube search work, while transport,
+  seek, and shuffle are unavailable. An unidentified source is also display-only.
+  **Play Playlist** still starts the selected playlist in Music.
 - **Refresh interval** - how often the pill polls the player (1 / 2 / 3 / 5 / 10s;
-  3s default, shorter = more battery).
+  3s default, shorter = more battery), including MediaRemote reads for streaming
+  tracks. Progress advances locally between polls; transport actions request a
+  fresh snapshot.
 - **Switch to Spotify** - see [Switching backends](#switching-backends).
 
 ### Streaming vs. library tracks
@@ -278,6 +284,9 @@ so you can leave your config as-is and toggle from the menu whenever you like.
   longer use may surface rough edges.
 
 ## Development
+
+Contributions are welcome, including bug reports, fixes, documentation
+improvements, and Apple Music testing.
 
 For hacking on the Spoon itself, clone to a directory **without** the `.spoon`
 extension and symlink it into place - Hammerspoon claims the `.spoon` extension,

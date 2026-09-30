@@ -4,5 +4,8 @@ docs.json
 # macOS
 .DS_Store
 
+# Local code navigation cache
+.serena/
+
 # Runtime caches written to ~/.hammerspoon, never here — listed for safety
 .hammertunes-playlists.json

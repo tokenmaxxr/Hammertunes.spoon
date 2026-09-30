@@ -34,14 +34,13 @@ local onChange = nil
 
 -- Two-path result cache: once we know which path works for the current track
 -- (AppleScript vs MediaRemote fallback), we stay on that path until the track
--- changes. This keeps getState() to ONE osascript call per tick instead of
--- two on every streaming track.
+-- changes. Both paths honor the configured expensive-read interval.
 --
 -- "as"  = AppleScript succeeded last time (library track)
 -- "mr"  = MediaRemote fallback succeeded last time (streaming track)
 -- nil   = unknown; probe on next call
 local cachedPath = nil     -- "as" | "mr" | nil
-local lastKnownTitle = nil -- used to detect track changes and reset cachedPath
+local lastKnownIdentity = nil -- used to detect track changes and reset cachedPath
 
 -- Artwork: exported once per library track to a PER-TRACK path. The path must
 -- be unique per track because pill.lua caches loaded images keyed by path — a
@@ -75,10 +74,12 @@ local playlistsCache = nil
 -- read is a blocking subprocess (~150 ms); running it every 1 Hz tick janks
 -- the UI, so the steady-state "mr" path refreshes this asynchronously via
 -- hs.task and serves the last good snapshot (progress is interpolated locally
--- from the snapshot's timestamp/elapsed/rate, see mrProgress). mrTaskInFlight
--- single-flights the background read so ticks don't pile up overlapping tasks.
+-- from the snapshot's timestamp/elapsed/rate, see mrProgress). The platform
+-- adapter single-flights reads and cancels callbacks from obsolete requests.
 local mrSnapshot = nil
-local mrTaskInFlight = false
+local mrSnapshotAt = -math.huge
+local mrShuffle = false
+local warmupTimer = nil
 
 -- Library ("as") path snapshot + throttle, mirroring the streaming path and the
 -- Spotify backend. MUSIC_QUERY is a ~150 ms call (macOS recompiles the script and
@@ -86,7 +87,7 @@ local mrTaskInFlight = false
 -- running it on every 1 Hz tick was a large energy cost. Instead we read it at
 -- most once per poll.get() seconds and serve a locally-interpolated copy in
 -- between; a track or play/pause change is picked up on the next real read.
--- asSnapshotAt = 0 forces a fresh read (used after transport actions).
+-- Transport actions invalidate both snapshot timestamps for the next render.
 --
 -- The interval is user-configurable (right-click "Refresh interval") and shared
 -- with the Spotify backend via backends/pollinterval.lua, so the choice applies
@@ -99,9 +100,15 @@ local prog = dofile(siblingDir .. "progress.lua") -- shared calcProgress / inter
 module.getPollInterval = poll.get
 module.setPollInterval = poll.set
 
+local platform = dofile(siblingDir .. "applemusic/platform.lua")
+local readMediaRemote = platform.read
 local asSnapshot = nil
 local asSnapshotAt = 0
-local function invalidateAsSnapshot() asSnapshotAt = 0 end
+local function invalidateAsSnapshot()
+  asSnapshotAt = -math.huge
+  mrSnapshotAt = -math.huge
+  platform.cancel()
+end
 
 -- MediaRemote reports system-wide Now Playing, so in Apple Music mode it also
 -- sees browsers, Spotify, etc. By default we show only Apple Music's own media;
@@ -113,16 +120,16 @@ local SPOTIFY_BUNDLE = "com.spotify.client"
 local SHOW_OTHER_SOURCES_KEY = "Hammertunes.applemusic.showOtherSources"
 local showOtherSources = false
 
--- Warn-once flags for degraded paths.
-local warnedMediaRemote = false
-
 -- Reset the now-playing caches and report the app as not running. Used wherever
 -- getState() determines Music isn't running.
 local function notRunning()
+  platform.cancel()
   cachedPath = nil
-  lastKnownTitle = nil
+  lastKnownIdentity = nil
   mrSnapshot = nil
   asSnapshot = nil
+  mrSnapshotAt = -math.huge
+  currentLiked, currentLikedTrackId = nil, nil
   currentName, nameDirty = nil, false
   return { running = false }
 end
@@ -134,6 +141,8 @@ local function runningState(playing, shuffle)
     running = true, playing = playing,
     track = nil, artist = nil, progress = 0, durMs = 0,
     artUrl = nil, artPath = nil, trackId = nil, shuffle = shuffle,
+    sourceBundleId = MUSIC_BUNDLE, sourceName = "Music",
+    canControl = true, canSeek = false, canLike = false, canAddToPlaylist = false,
   }
 end
 
@@ -187,187 +196,19 @@ local function exportArt(trackId)
   return nil
 end
 
--- ---------------------------------------------------------------------------
--- MediaRemote fallback via JXA (streaming / catalog tracks)
--- ---------------------------------------------------------------------------
--- The private MediaRemote framework provides now-playing info system-wide,
--- bypassing the Music.app AppleScript dictionary. It is the only way to read
--- metadata for Apple Music catalog tracks not added to the library on macOS
--- Tahoe (26.x), where `tell application "Music" to get name of current track`
--- raises error -1728 for streaming tracks.
---
--- Caveat: MediaRemote is a private framework. It can change or be removed
--- in future OS updates. If loading fails we degrade silently (warn once) and
--- fall back to library-tracks-only coverage.
-
--- JXA source that loads MediaRemote and reads now-playing info synchronously
--- via MRNowPlayingRequest (macOS 12+). Returns a JSON string.
---
--- Key names confirmed against MediaRemote.framework headers and the SKaplan
--- gist (https://gist.github.com/SKaplanOfficial/f9f5bdd6455436203d0d318c078358de)
--- which shows the MRNowPlayingRequest synchronous approach works on macOS 15+.
---
--- artworkId is, for Apple Music content, a direct https cover URL - we use it
--- as artUrl and let images.lua fetch it (see mrArtUrl). We do NOT read the raw
--- artwork bytes: that blob is 100-400 KB and, for the Spotify/Apple Music
--- sources this Spoon targets, artworkId is always a URL, so the bytes are never
--- needed.
-local MEDIA_REMOTE_JXA = [[
-  ObjC.import('Foundation');
-  function run() {
-    try {
-      var fw = $.NSBundle.bundleWithPath(
-        '/System/Library/PrivateFrameworks/MediaRemote.framework'
-      );
-      if (!fw.load) { return JSON.stringify({error: "bundle load failed"}); }
-      fw.load;
-
-      var req = $.NSClassFromString('MRNowPlayingRequest');
-      if (!req || !req.localNowPlayingItem) {
-        return JSON.stringify({error: "MRNowPlayingRequest unavailable"});
-      }
-      var item = req.localNowPlayingItem;
-      if (!item || !item.nowPlayingInfo) {
-        return JSON.stringify({error: "no nowPlayingInfo"});
-      }
-      var info = item.nowPlayingInfo;
-
-      function str(key) {
-        try {
-          var v = info.valueForKey(key);
-          return (v && v.js !== undefined) ? v.js : null;
-        } catch(e) { return null; }
-      }
-      function num(key) {
-        try {
-          var v = info.valueForKey(key);
-          return (v && v.doubleValue !== undefined) ? v.doubleValue : null;
-        } catch(e) { return null; }
-      }
-
-      var title    = str('kMRMediaRemoteNowPlayingInfoTitle');
-      var artist   = str('kMRMediaRemoteNowPlayingInfoArtist');
-      var album    = str('kMRMediaRemoteNowPlayingInfoAlbum');
-      var duration = num('kMRMediaRemoteNowPlayingInfoDuration');
-      var elapsed  = num('kMRMediaRemoteNowPlayingInfoElapsedTime');
-      var rate     = num('kMRMediaRemoteNowPlayingInfoPlaybackRate');
-      var artworkId = str('kMRMediaRemoteNowPlayingInfoArtworkIdentifier');
-
-      // Timestamp when the elapsed time snapshot was taken (monotonic clock).
-      // If present, actual position = elapsed + (now - timestamp) * rate.
-      // Fall back to elapsed alone if the timestamp key is absent.
-      var ts = null;
-      try {
-        var tsVal = info.valueForKey('kMRMediaRemoteNowPlayingInfoTimestamp');
-        if (tsVal && tsVal.doubleValue !== undefined) {
-          ts = tsVal.doubleValue;
-        }
-      } catch(e) {}
-
-      // Which app owns system Now Playing. localNowPlayingItem is system-wide,
-      // so this is how we tell an Apple Music track from a browser/Spotify one
-      // (see mrSourceLabel). bundleId is the gate; appName is the display label.
-      var bundleId = null, appName = null;
-      try {
-        var pp = req.localNowPlayingPlayerPath;
-        if (pp && pp.client) {
-          var b = pp.client.bundleIdentifier;
-          bundleId = (b && b.js !== undefined) ? b.js : null;
-          var d = pp.client.displayName;
-          appName = (d && d.js !== undefined) ? d.js : null;
-        }
-      } catch(e) {}
-
-      return JSON.stringify({
-        title: title, artist: artist, album: album,
-        duration: duration, elapsed: elapsed, rate: rate, timestamp: ts,
-        artworkId: artworkId, bundleId: bundleId, appName: appName
-      });
-    } catch(e) {
-      return JSON.stringify({error: String(e)});
-    }
-  }
-]]
-
--- CRITICAL: MediaRemote's now-playing info only populates for a freshly spawned
--- process on macOS Tahoe (26.x). Run in-process via hs.osascript.javascript and
--- `localNowPlayingItem.nowPlayingInfo` comes back empty ("no nowPlayingInfo")
--- inside Hammerspoon's long-lived JSContext - verified by running the identical
--- JXA both ways at the same instant: a separate `osascript` process gets the
--- track, the in-process call does not. So we shell the JXA out through osascript
--- (sync via hs.execute, or async via hs.task). The script is written to a temp
--- file once, lazily (passing it inline would require escaping its own quotes).
-local mrJxaPath = nil  -- temp file path, false on write failure, nil until tried
-local function jxaPath()
-  if mrJxaPath ~= nil then return mrJxaPath or nil end
-  local path = os.tmpname()
-  local f = io.open(path, "w")
-  if not f then mrJxaPath = false; return nil end
-  f:write(MEDIA_REMOTE_JXA)
-  f:close()
-  mrJxaPath = path
-  return path
-end
-
--- Log a MediaRemote degradation once. The private framework can break across
--- OS updates; we warn the first time and then stay quiet to avoid log spam.
-local function warnMROnce(msg)
-  if not warnedMediaRemote then
-    log.w(msg)
-    warnedMediaRemote = true
-  end
-end
-
--- Parse the JXA's stdout (a JSON string) into a now-playing table, or nil on
--- any failure. Shared by the sync and async readers; warns once on framework
--- failure so a degraded MediaRemote doesn't spam the log.
-local function parseMrOutput(output)
-  if type(output) ~= "string" or output == "" then
-    warnMROnce("MediaRemote JXA call failed; streaming track metadata unavailable: " .. tostring(output))
-    return nil
-  end
-  local data = hs.json.decode(output)
-  if not data then
-    warnMROnce("MediaRemote JXA returned non-JSON: " .. tostring(output))
-    return nil
-  end
-  if data.error then
-    -- "no nowPlayingInfo" is normal when nothing is playing; don't escalate.
-    if data.error ~= "no nowPlayingInfo" then
-      warnMROnce("MediaRemote JXA error: " .. tostring(data.error))
-    end
-    return nil
-  end
-  return data
-end
-
--- Synchronous MediaRemote read (blocks ~150 ms). Used only where we need the
--- answer right now and at most once per track: the first tick a streaming track
--- is detected (FALLBACK), and resolving a library track's cover URL once per
--- trackId (libArtUrl). The steady-state hot path uses refreshMrSnapshot instead.
-local function readMediaRemote()
-  local path = jxaPath()
-  if not path then
-    warnMROnce("MediaRemote: could not write JXA temp file; streaming metadata unavailable")
-    return nil
-  end
-  return parseMrOutput(hs.execute("/usr/bin/osascript -l JavaScript " .. path))
-end
-
--- Kick a background MediaRemote read and store the result in mrSnapshot when it
--- lands. Single-flighted: a tick that fires while a read is still running is a
--- no-op, so the 1 Hz hot path never blocks or stacks up osascript processes.
--- A failed/empty read sets mrSnapshot to nil, which the hot path treats as
--- "MediaRemote went dark" and re-probes - self-healing.
+-- Refresh policy lives here; the platform adapter owns subprocess lifetime.
 local function refreshMrSnapshot()
-  if mrTaskInFlight then return end
-  local path = jxaPath()
-  if not path then return end
-  mrTaskInFlight = true
-  hs.task.new("/usr/bin/osascript", function(_code, stdOut, _stdErr)
-    mrTaskInFlight = false
-    mrSnapshot = parseMrOutput(stdOut)
-  end, { "-l", "JavaScript", path }):start()
+  local now = hs.timer.secondsSinceEpoch()
+  if now - mrSnapshotAt < poll.get() then return false end
+  mrSnapshotAt = now
+  platform.readAsync(function(snapshot) mrSnapshot = snapshot end)
+  return true
+end
+
+-- Titles are not identities: different artists and albums routinely reuse them.
+local function mrIdentity(data)
+  return table.concat({data.bundleId or "", data.title or "", data.artist or "",
+    data.album or "", tostring(data.duration or "")}, "\0")
 end
 
 -- ---------------------------------------------------------------------------
@@ -446,16 +287,12 @@ end
 -- have no library trackId, so no library actions and no local artPath; the
 -- cover is always the MediaRemote URL (artUrl) or nothing.
 --
--- source (optional) is a foreign-app label from mrSourceLabel; when set, it's
--- folded into the artist line as "… · via <App>" so the pill and tooltip make
--- clear the media isn't Apple Music's own.
+-- Source identity and available actions stay separate from track metadata so
+-- copying an artist name never includes a presentation-only source label.
 local function mrState(mrData, shuffle, artUrl, source)
   local durMs, progress = mrProgress(mrData)
   local title = mrData.title
   local artist = (mrData.artist ~= "" and mrData.artist) or nil
-  if source then
-    artist = artist and (artist .. " · via " .. source) or ("via " .. source)
-  end
   return {
     running  = true,
     playing  = (tonumber(mrData.rate) or 0) > 0,
@@ -467,65 +304,18 @@ local function mrState(mrData, shuffle, artUrl, source)
     artPath  = nil,
     trackId  = nil,
     shuffle  = shuffle,
+    sourceBundleId = mrData.bundleId,
+    sourceName = source or mrData.appName or (mrData.bundleId == MUSIC_BUNDLE and "Music" or nil),
+    canControl = mrData.bundleId == MUSIC_BUNDLE,
+    canSeek = mrData.bundleId == MUSIC_BUNDLE and durMs > 0,
+    canLike = false,
+    canAddToPlaylist = false,
   }
 end
 
 -- ---------------------------------------------------------------------------
 -- AppleScript helpers
 -- ---------------------------------------------------------------------------
-
--- Single multi-field AppleScript for the library-track path. Tab-separated
--- so track/artist names containing "|" don't break parsing (mirrors the
--- Spotify backend's SPOTIFY_QUERY pattern). Reads in one osascript call:
---   playerState, shuffleEnabled, name, artist, databaseId, duration, playerPosition, favorited
---
--- Error -1728 fires when Music is running but the current track is a
--- streaming catalog track not in the library. We catch it and return a
--- sentinel so getState() knows to fall back to MediaRemote.
-local MUSIC_QUERY = [[
-if application "Music" is running then
-  tell application "Music"
-    set s to player state as text
-    set sh to shuffle enabled as text
-    try
-      set t to current track
-      set n to name of t
-      set ar to artist of t
-      set di to database id of t as text
-      set du to duration of t
-      set pp to player position
-      set fv to favorited of t as text
-      return "OK" & tab & s & tab & sh & tab & n & tab & ar & tab & di & tab & du & tab & pp & tab & fv
-    on error errMsg number errNum
-      -- -1728: can't get object (streaming track not in library)
-      -- Return the player state + shuffle so transport UI stays accurate.
-      return "FALLBACK" & tab & s & tab & sh & tab & errNum as text
-    end try
-  end tell
-else
-  return "NOTRUNNING"
-end if
-]]
-
--- Read shuffle state cheaply when we already know we're on the MediaRemote
--- path. Avoids a full MUSIC_QUERY re-probe just to get shuffle.
-local SHUFFLE_QUERY = [[
-if application "Music" is running then
-  tell application "Music"
-    return shuffle enabled as text
-  end tell
-else
-  return "false"
-end if
-]]
-
-local function readShuffle()
-  local ok, result = hs.osascript.applescript(SHUFFLE_QUERY)
-  if ok and type(result) == "string" then
-    return result == "true"
-  end
-  return false
-end
 
 -- Escape a string for embedding inside an AppleScript double-quoted literal.
 -- Backslash first, then the quote, so playlist names with either survive.
@@ -555,13 +345,17 @@ local NAME_SCRIPT = tellMusic([[
     return ""
   end try]], '""')
 
--- favorited of current track, "nil" when unavailable or Music closed.
-local FAVORITED_SCRIPT = tellMusic([[
-  try
-    return favorited of current track as text
-  on error
-    return "nil"
-  end try]], '"nil"')
+-- Database IDs are numeric Apple Music library identities, never script text.
+local function trackReference(trackId)
+  local id = tonumber(trackId)
+  if not id or id <= 0 or id % 1 ~= 0 then return nil end
+  return "(first track of library playlist 1 whose database ID is " .. string.format("%.0f", id) .. ")"
+end
+
+local function playlistReference(playlistId)
+  if type(playlistId) ~= "string" or playlistId == "" then return nil end
+  return '(first user playlist whose persistent ID is "' .. asQuote(playlistId) .. '")'
+end
 
 -- Tab/linefeed-separated "<name>\t<persistentId>" rows, "" when Music closed.
 local PLAYLISTS_SCRIPT = tellMusic([[
@@ -593,7 +387,7 @@ module.getState = function()
 
   -- Throttle the library path: serve an interpolated copy of the last "as" read
   -- between polls (see asSnapshot). Only the steady "as" path is throttled here;
-  -- the "mr" path below already refreshes asynchronously off the hot path.
+  -- the "mr" path below refreshes asynchronously at the same interval.
   local now = hs.timer.secondsSinceEpoch()
   local elapsed = now - asSnapshotAt
   if cachedPath == "as" and asSnapshot and elapsed < poll.get() then
@@ -603,7 +397,7 @@ module.getState = function()
   -- Try the AppleScript library path first (or immediately if it succeeded
   -- last time). cachedPath == "as" means we expect this to work.
   if cachedPath ~= "mr" then
-    local ok, result = hs.osascript.applescript(MUSIC_QUERY)
+    local ok, result = platform.readLibrary()
     if ok and type(result) == "string" then
       if result == "NOTRUNNING" then
         return notRunning()
@@ -619,8 +413,8 @@ module.getState = function()
 
         cachedPath = "as"
         -- Track-change detection: refresh the cached context name on change.
-        if name ~= lastKnownTitle then
-          lastKnownTitle = name
+        if trackId ~= lastKnownIdentity then
+          lastKnownIdentity = trackId
           nameDirty = true
         end
 
@@ -648,6 +442,12 @@ module.getState = function()
           artPath  = artPath,
           trackId  = trackId,
           shuffle  = shuffle == "true",
+          sourceBundleId = MUSIC_BUNDLE,
+          sourceName = "Music",
+          canControl = true,
+          canSeek = durMs > 0,
+          canLike = trackId ~= nil,
+          canAddToPlaylist = trackId ~= nil,
         }
         asSnapshot = st
         asSnapshotAt = now
@@ -678,9 +478,11 @@ module.getState = function()
         -- "idle" cheaply instead of re-running this blocking read every tick.
         cachedPath = "mr"
         mrSnapshot = mrData
+        mrSnapshotAt = now
+        mrShuffle = shuffleStr == "true"
 
-        if mrData.title ~= lastKnownTitle then
-          lastKnownTitle = mrData.title
+        if mrIdentity(mrData) ~= lastKnownIdentity then
+          lastKnownIdentity = mrIdentity(mrData)
           nameDirty = true
           -- Streaming track: clear liked since we have no trackId.
           currentLiked = nil
@@ -702,10 +504,10 @@ module.getState = function()
 
   -- cachedPath == "mr": we know the current track is streaming. Kick a
   -- background MediaRemote refresh (non-blocking) and serve the last snapshot,
-  -- so the 1 Hz tick never blocks on the ~150 ms subprocess. Shuffle is a cheap
-  -- in-process read; progress is interpolated locally in mrProgress, so a
-  -- one-tick-stale snapshot still shows a smoothly advancing bar.
-  refreshMrSnapshot()
+  -- so the 1 Hz tick never blocks on the ~150 ms subprocess. Shuffle is read
+  -- at the same interval; progress is interpolated locally in mrProgress, so a
+  -- cached snapshot still shows a smoothly advancing bar.
+  if refreshMrSnapshot() then mrShuffle = platform.readShuffle() end
   local mrData = mrSnapshot
 
   if not mrData then
@@ -713,27 +515,25 @@ module.getState = function()
     -- title a track change can't be detected, so drop the path cache and let
     -- the next tick re-probe AppleScript - self-healing.
     cachedPath = nil
-    return runningState(false, readShuffle())
+    return runningState(false, mrShuffle)
   end
 
-  -- Detect track change: if title changed, re-probe on the next tick (which
+  -- Detect track change by source and metadata, then re-probe on the next tick (which
   -- goes through the FALLBACK path and a fresh synchronous read).
-  if mrData.title ~= lastKnownTitle then
-    lastKnownTitle = mrData.title
+  if mrIdentity(mrData) ~= lastKnownIdentity then
+    lastKnownIdentity = mrIdentity(mrData)
     cachedPath = nil
     nameDirty = true
     currentLiked = nil
     currentLikedTrackId = nil
   end
 
-  -- Source gate: a foreign/Spotify source shows idle. Read shuffle only once we
-  -- know we'll display the track — otherwise this blocking osascript would run
-  -- every tick while another app holds Now Playing, for a value we never show.
+  -- Apply the source preference independently of the cached read schedule.
   local accepted, source = mrSourceLabel(mrData)
   if not accepted then
     return runningState(false, false)
   end
-  return mrState(mrData, readShuffle(), mrArtUrl(mrData), source)
+  return mrState(mrData, mrShuffle, mrArtUrl(mrData), source)
 end
 
 -- ---------------------------------------------------------------------------
@@ -742,16 +542,29 @@ end
 
 -- Transport mutators invalidate the cached snapshot so the change shows on the
 -- next render rather than after the poll interval (see invalidateAsSnapshot).
-module.next        = function() hs.itunes.next(); invalidateAsSnapshot() end
-module.previous    = function() hs.itunes.previous(); invalidateAsSnapshot() end
-module.playpause   = function() hs.itunes.playpause(); invalidateAsSnapshot() end
-module.play        = function() hs.itunes.play(); invalidateAsSnapshot() end
-module.getPosition = function() return hs.itunes.getPosition() end
-module.setPosition = function(sec) hs.itunes.setPosition(sec); invalidateAsSnapshot() end
+local function controlsMusic()
+  if not mrSnapshot or cachedPath == "as" then return true end
+  -- A rejected source displays the empty Music state, whose transport still
+  -- belongs to Music. Only accepted foreign/unknown media is display-only.
+  local accepted = mrSourceLabel(mrSnapshot)
+  return not accepted or mrSnapshot.bundleId == MUSIC_BUNDLE
+end
+local function transport(action, ...)
+  if not controlsMusic() then return end
+  hs.itunes[action](...)
+  invalidateAsSnapshot()
+end
+module.next        = function() transport("next") end
+module.previous    = function() transport("previous") end
+module.playpause   = function() transport("playpause") end
+module.play        = function() transport("play") end
+module.getPosition = function() if controlsMusic() then return hs.itunes.getPosition() end end
+module.setPosition = function(sec) transport("setPosition", sec) end
 
 -- Music's shuffle property is `shuffle enabled` (a boolean). Note: Music also
 -- has `song repeat` (off/one/all); we don't touch that here.
 module.setShuffling = function(on)
+  if not controlsMusic() then return end
   hs.osascript.applescript(
     'tell application "Music" to set shuffle enabled to ' .. tostring(on)
   )
@@ -770,7 +583,9 @@ module.setShowOtherSources = function(on)
   -- Re-probe next tick so the change takes effect immediately rather than after
   -- the current track ends (the "mr" path would otherwise serve its decision).
   cachedPath = nil
-  lastKnownTitle = nil
+  lastKnownIdentity = nil
+  platform.cancel()
+  mrSnapshotAt = -math.huge
 end
 
 -- ---------------------------------------------------------------------------
@@ -782,6 +597,7 @@ end
 -- change (nameDirty); otherwise returns the cached value so the 1 Hz render
 -- loop doesn't spend an osascript on it every tick.
 module.getName = function()
+  if not controlsMusic() then return nil end
   if not nameDirty then return currentName end
   nameDirty = false
   local ok, result = hs.osascript.applescript(NAME_SCRIPT)
@@ -805,7 +621,10 @@ module.refreshLiked = function(trackId)
   end
   if trackId == currentLikedTrackId and currentLiked ~= nil then return end
   currentLikedTrackId = trackId
-  local ok, result = hs.osascript.applescript(FAVORITED_SCRIPT)
+  local ref = trackReference(trackId)
+  if not ref then currentLiked = nil; return end
+  local ok, result = hs.osascript.applescript(tellMusic(
+    "try\nreturn favorited of " .. ref .. ' as text\non error\nreturn "nil"\nend try', '"nil"'))
   if ok and type(result) == "string" and result ~= "nil" then
     currentLiked = result == "true"
   else
@@ -825,27 +644,19 @@ end
 -- Like / unlike (library tracks only)
 -- ---------------------------------------------------------------------------
 
-module.like = function(trackId)
-  if not trackId then return end
-  local ok = hs.osascript.applescript(
-    'tell application "Music" to set favorited of current track to true'
-  )
+local function setLiked(trackId, liked)
+  local ref = trackReference(trackId)
+  if not ref then return end
+  local ok = hs.osascript.applescript(tellMusic(
+    "set favorited of " .. ref .. " to " .. tostring(liked), "false"))
   if ok then
-    currentLiked = true
+    if trackId == currentLikedTrackId then currentLiked = liked end
+    asSnapshotAt = -math.huge
     if onChange then onChange() end
   end
 end
-
-module.unlike = function(trackId)
-  if not trackId then return end
-  local ok = hs.osascript.applescript(
-    'tell application "Music" to set favorited of current track to false'
-  )
-  if ok then
-    currentLiked = false
-    if onChange then onChange() end
-  end
-end
+module.like = function(trackId) setLiked(trackId, true) end
+module.unlike = function(trackId) setLiked(trackId, false) end
 
 -- ---------------------------------------------------------------------------
 -- Playlists
@@ -855,8 +666,7 @@ end
 -- synchronously (AppleScript enumeration blocks until complete).
 --
 -- URI scheme: "applemusic:playlist:<persistentId>". The persistent ID is the
--- stable key; playContext/addToPlaylist resolve it back to the playlist name
--- (which AppleScript plays/duplicates by).
+-- stable key; playContext/addToPlaylist resolve the playlist directly by ID.
 local function buildPlaylistList()
   -- Fetch name and persistent ID together so we have a stable id even when
   -- names are duplicated. Returns tab-separated rows, newline-separated.
@@ -894,98 +704,54 @@ end
 module.getRecentlyPlayed    = function() return nil end
 module.refreshRecentlyPlayed = function(cb) if cb then cb({}) end end
 
--- Add the current library track to a playlist by persistent ID.
--- Resolves the playlist name from the cache; fails closed for streaming tracks.
+-- Captured IDs keep menu actions attached to the selected track and playlist,
+-- even if playback changes or two playlists have the same display name.
 module.addToPlaylist = function(playlistId, trackId, cb)
   cb = cb or function() end
-  if not trackId then
-    -- Streaming track: no library object to duplicate.
-    cb(false)
-    return
-  end
-  -- Find the playlist name from the cache.
-  local playlistName = nil
-  for _, p in ipairs(playlistsCache or {}) do
-    if p.id == playlistId then
-      playlistName = p.name
-      break
-    end
-  end
-  if not playlistName then
-    log.w("addToPlaylist: playlist id not found in cache: " .. tostring(playlistId))
-    cb(false)
-    return
-  end
-  local safeName = asQuote(playlistName)
-  -- Plain library tracks duplicate straight into the playlist. Subscription /
-  -- URL tracks (Apple Music catalog, autoplay, stations) error with "Can only
-  -- duplicate subscription tracks to library source", so fall back to the
-  -- two-step the Music UI does implicitly: add the track to the library, find
-  -- the library copy (a new object; matched by name+artist since `duplicate to
-  -- source` returns no reference), and duplicate THAT into the playlist.
-  local script = string.format([[
-    tell application "Music"
-      try
-        duplicate current track to user playlist "%s"
-        return "OK"
-      on error
-        try
-          set tn to name of current track
-          set ta to artist of current track
-          try
-            duplicate current track to source "Library"
-          end try -- harmless if it's already in the library
-          set libT to (first track of library playlist 1 whose name is tn and artist is ta)
-          duplicate libT to user playlist "%s"
-          return "OK"
-        on error errMsg
-          return "ERROR: " & errMsg
-        end try
-      end try
-    end tell
-  ]], safeName, safeName)
+  local track = trackReference(trackId)
+  local playlist = playlistReference(playlistId)
+  if not track or not playlist then cb(false); return end
+  local script = tellMusic("try\nduplicate " .. track .. " to " .. playlist
+    .. '\nreturn "OK"\non error errMsg\nreturn "ERROR: " & errMsg\nend try', '"ERROR"')
   local ok, result = hs.osascript.applescript(script)
-  if ok and type(result) == "string" and result == "OK" then
-    cb(true)
-  else
-    log.w("addToPlaylist failed: " .. tostring(result))
-    cb(false)
+  if not ok or result ~= "OK" then
+    -- Subscription tracks may only duplicate to the Library source initially.
+    -- Keep the returned object, or resolve its captured persistent identity if
+    -- Music supplies no reference. Never guess by display name or current track.
+    local fallback = string.format([[
+      try
+        set selectedTrack to %s
+        set selectedPlaylist to %s
+        set selectedPersistentID to persistent ID of selectedTrack
+        set importedTrack to missing value
+        try
+          set importedTrack to duplicate selectedTrack to source "Library"
+        end try
+        if importedTrack is missing value then
+          set importedTrack to (first track of library playlist 1 whose persistent ID is selectedPersistentID)
+        end if
+        duplicate importedTrack to selectedPlaylist
+        return "OK"
+      on error errMsg
+        return "ERROR: " & errMsg
+      end try
+    ]], track, playlist)
+    ok, result = hs.osascript.applescript(tellMusic(fallback, '"ERROR"'))
   end
+  cb(ok and result == "OK")
 end
 
--- ---------------------------------------------------------------------------
--- Play context
--- ---------------------------------------------------------------------------
-
--- Resolve playlist name from a "applemusic:playlist:<persistentId>" URI.
-local function nameFromUri(uri)
-  local pid = uri and uri:match("^applemusic:playlist:(.+)$")
-  if not pid then return nil end
-  for _, p in ipairs(playlistsCache or {}) do
-    if p.id == pid then return p.name end
-  end
-  return nil
-end
-
--- mode: "play" | "shuffle" | "smart"
--- Apple Music has no smart shuffle; treat "smart" == "shuffle".
+-- mode: "play" | "shuffle" | "smart"; Music has no smart shuffle.
 module.playContext = function(uri, mode)
-  if not uri then return end
-  mode = mode or "play"
-  local name = nameFromUri(uri)
-  if not name then
-    log.w("playContext: could not resolve playlist name for uri: " .. tostring(uri))
-    return
-  end
-  local shuffleOn = mode ~= "play"
-  local safeName = asQuote(name)
-  local script = string.format([[
-    tell application "Music"
-      set shuffle enabled to %s
-      play playlist named "%s"
-    end tell
-  ]], tostring(shuffleOn), safeName)
+  local pid = type(uri) == "string" and uri:match("^applemusic:playlist:(.+)$")
+  local playlist = playlistReference(pid)
+  if not playlist then return end
+  local script = 'tell application "Music"\nset shuffle enabled to '
+    .. tostring((mode or "play") ~= "play") .. "\nplay " .. playlist .. "\nend tell"
   hs.osascript.applescript(script)
+  invalidateAsSnapshot()
+  cachedPath = nil
+  mrSnapshot = nil
 end
 
 -- module.playLikedSongs intentionally absent — pill.lua guards `if api.playLikedSongs`
@@ -1003,17 +769,28 @@ module.start = function(changeCallback)
   if hs.settings then showOtherSources = hs.settings.get(SHOW_OTHER_SOURCES_KEY) == true end
   -- Warm the playlist cache in the background (AppleScript is synchronous
   -- but may take ~200ms on a large library; defer so the pill renders first).
-  hs.timer.doAfter(0.5, function() module.refreshPlaylists() end)
+  if warmupTimer then warmupTimer:stop() end
+  local pending = {}
+  warmupTimer = pending
+  local timer = hs.timer.doAfter(0.5, function()
+    if warmupTimer ~= pending then return end
+    warmupTimer = nil
+    module.refreshPlaylists()
+  end)
+  if warmupTimer == pending then
+    pending.stop = function() timer:stop() end
+  end
 end
 
 module.stop = function()
+  if warmupTimer then warmupTimer:stop(); warmupTimer = nil end
   onChange = nil
   cachedPath = nil
-  lastKnownTitle = nil
+  lastKnownIdentity = nil
   mrSnapshot = nil
   asSnapshot = nil
   asSnapshotAt = 0
-  mrTaskInFlight = false
+  mrSnapshotAt = -math.huge
   currentName = nil
   nameDirty = false
   -- Remove the per-track artwork files we exported this session.
@@ -1022,13 +799,10 @@ module.stop = function()
   end
   artCache = {}
   libArtUrlCache = {}
-  -- Remove the JXA temp file written by jxaPath() and let it be re-created.
-  if type(mrJxaPath) == "string" then os.remove(mrJxaPath) end
-  mrJxaPath = nil
+  platform.stop()
   currentLiked = nil
   currentLikedTrackId = nil
   playlistsCache = nil
-  warnedMediaRemote = false
 end
 
 module.authenticate = function(_id)
@@ -1047,7 +821,7 @@ module._test = {
   asQuote       = asQuote,
   mrArtUrl      = mrArtUrl,
   mrSourceLabel = mrSourceLabel,
-  parseMrOutput = parseMrOutput,
+  parseMrOutput = platform.parse,
   -- Expose internal tables/flags so tests can inspect state.
   artCache       = function() return artCache end,
   libArtUrlCache = function() return libArtUrlCache end,
@@ -1059,9 +833,10 @@ module._test = {
     mrSnapshot      = nil
     asSnapshot      = nil
     asSnapshotAt    = 0
-    mrTaskInFlight  = false
+    platform.cancel()
+    mrSnapshotAt = -math.huge
     cachedPath      = nil
-    lastKnownTitle  = nil
+    lastKnownIdentity  = nil
     showOtherSources = false
   end,
 }
