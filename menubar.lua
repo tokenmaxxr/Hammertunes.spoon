@@ -50,11 +50,17 @@ local lastTrackId = nil
 local lastDurMs = 0
 local holdTimer = nil
 local holdFired = false
+local leftPressed = false
 local lastSeekTime = 0
 local mouseDownWatcher = nil
 local lastPlaying = false
 local lastShuffle = false
 local lastRunning = false
+-- True while a right-click menu is up (see showRightClickMenu). pendingSeekRatio
+-- holds a reopen request from a right-click that landed while the menu was open:
+-- a number (0..1) or false (reopen, no seek ratio); nil means no reopen pending.
+local menuOpen = false
+local pendingSeekRatio = nil
 
 -- hs.menubar:frame() converts Cocoa coords using mainScreen (the focused
 -- screen), but _frame() coordinates are anchored to the primary display.
@@ -266,48 +272,75 @@ end
 -- setMenu and setClickCallback are mutually exclusive on hs.menubar, so we
 -- attach the menu just for the popup and detach it right after. popupMenu is
 -- blocking, so the setMenu(nil) only fires once the user dismisses the menu.
-local function showRightClickMenu()
+-- seekRatio (0..1, optional) is where on the pill a right-click landed; the menu
+-- offers a "Seek to <time>" item that jumps the playhead there. Nil for menus
+-- opened by other paths (e.g. a click on the inactive pill).
+local function showRightClickMenu(seekRatio)
   if not menu then return end
-  -- Refresh shuffle/playlist caches for the *next* open; popupMenu is blocking,
-  -- so these async results can't reach the menu we're about to build.
-  if api then
-    api.refresh()
-    api.refreshPlaylists()
-    api.refreshRecentlyPlayed()
-  end
-  local items = rightclick.build({
-    api = api,
-    track = lastTrack,
-    artist = lastArtist,
-    trackId = lastTrackId,
-    running = lastRunning,
-    shuffle = lastShuffle,
-    menuIcon = menuIcons.getUrl,
-    copyCurrent = copyCurrent,
-    openOnYouTube = openOnYouTube,
-    scheduleRender = scheduleRender,
-    switchLabel = switchLabel,
-    switchBackend = switchBackend,
-    updateAvailable = updateAvailable,
-    updateNow = updateNow,
-  })
-  menu:setMenu(items)
-  menu:popupMenu(hs.mouse.absolutePosition(), true)
-  menu:setMenu(nil)
-end
-
-local function onClick()
-  cancelHold()
-  if holdFired then
-    holdFired = false
-    scheduleRender()
+  -- popupMenu is modal and pumps its own event loop, so right-clicking again
+  -- while a menu is open re-enters here (the eventtap still fires during menu
+  -- tracking). We must NOT nest popups on the same menubar item — the nested
+  -- setMenu(nil) empties the menu the first popup is showing. Instead, record the
+  -- new click position, dismiss the open menu (Esc), and let the loop below
+  -- reopen at the new spot, so a second right-click MOVES the menu — and its
+  -- "Seek to" target — to where you just clicked. `false` = reopen with no seek
+  -- ratio (distinct from nil = no reopen pending).
+  if menuOpen then
+    pendingSeekRatio = seekRatio == nil and false or seekRatio
+    hs.eventtap.keyStroke({}, "escape", 0)
     return
   end
+  local reopen
+  repeat
+    -- Refresh shuffle/playlist caches for the *next* open; popupMenu is blocking,
+    -- so these async results can't reach the menu we're about to build.
+    if api then
+      api.refresh()
+      api.refreshPlaylists()
+      api.refreshRecentlyPlayed()
+    end
+    local items = rightclick.build({
+      api = api,
+      track = lastTrack,
+      artist = lastArtist,
+      trackId = lastTrackId,
+      running = lastRunning,
+      playing = lastPlaying,
+      shuffle = lastShuffle,
+      -- Seek-to-position: only when we have a track of known length to seek within.
+      seekRatio = (lastRunning and lastDurMs > 0) and seekRatio or nil,
+      durMs = lastDurMs,
+      seek = function(ratio)
+        if api and lastDurMs > 0 then api.setPosition(ratio * (lastDurMs / 1000)); scheduleRender() end
+      end,
+      menuIcon = menuIcons.getUrl,
+      copyCurrent = copyCurrent,
+      openOnYouTube = openOnYouTube,
+      scheduleRender = scheduleRender,
+      switchLabel = switchLabel,
+      switchBackend = switchBackend,
+      updateAvailable = updateAvailable,
+      updateNow = updateNow,
+    })
+    menu:setMenu(items)
+    menuOpen = true
+    menu:popupMenu(hs.mouse.absolutePosition(), true)
+    menuOpen = false
+    menu:setMenu(nil)
+    -- A right-click landed while we were open: reopen at that new position.
+    reopen = pendingSeekRatio ~= nil
+    seekRatio = pendingSeekRatio or nil -- `false` -> nil (reopen without a ratio)
+    pendingSeekRatio = nil
+  until not reopen
+end
 
+local function onClick(location)
   -- Player not running: the pill is just "♪" and transport clicks would hit a
-  -- dead app, so any click launches the player instead.
+  -- dead app, so a click opens the small menu (Open player / Switch to the
+  -- other backend) instead. Deferred past this callback like the right-click
+  -- path, since popupMenu blocks. Right-click opens the same menu.
   if not lastRunning then
-    if api then hs.application.launchOrFocus(api.appName) end
+    hs.timer.doAfter(0, showRightClickMenu)
     return
   end
 
@@ -317,7 +350,7 @@ local function onClick()
     return
   end
 
-  local relX = hs.mouse.absolutePosition().x - frame.x
+  local relX = (location or hs.mouse.absolutePosition()).x - frame.x
   if relX < frame.w * SIDE_ZONE_FRAC then
     onLeftClick()
   elseif relX >= frame.w * (1 - SIDE_ZONE_FRAC) then
@@ -350,33 +383,66 @@ module.start = function(deps)
     return
   end
   menu:setTitle("")
-  menu:setClickCallback(onClick)
+  menu:setClickCallback(function() onClick() end)
   pill = pillRenderer.new(menu, PILL_OPTS, { progressSteps = PILL_PROGRESS_STEPS })
   render()
   timer = hs.timer.doEvery(1, render):start()
   mouseDownWatcher = hs.eventtap.new({
     hs.eventtap.event.types.leftMouseDown,
+    hs.eventtap.event.types.leftMouseUp,
     hs.eventtap.event.types.leftMouseDragged,
     hs.eventtap.event.types.rightMouseDown,
   }, function(event)
     local etype = event:getType()
+    -- Own the entire gesture so native status-item mouse tracking cannot delay
+    -- the hold timer until release. Always clean up on mouse-up, even outside
+    -- the pill or if Command was pressed after mouse-down.
+    if etype == hs.eventtap.event.types.leftMouseUp and leftPressed then
+      leftPressed = false
+      cancelHold()
+      if holdFired then
+        holdFired = false
+        scheduleRender()
+      else
+        local frame = menuFrame()
+        local loc = event:location()
+        if frame and hs.geometry(loc):inside(frame) then
+          hs.timer.doAfter(0, function() onClick(loc) end)
+        end
+      end
+      return true
+    end
+    if etype == hs.eventtap.event.types.leftMouseDragged and leftPressed then
+      if holdFired and hs.timer.secondsSinceEpoch() - lastSeekTime >= SEEK_THROTTLE_SEC then
+        seekToMouse()
+      end
+      return true
+    end
     -- ⌘-click is macOS's menubar-reposition gesture; let it through so the
     -- pill can be dragged instead of seeking/playing or opening the menu.
     if event:getFlags().cmd then return false end
     if etype == hs.eventtap.event.types.rightMouseDown then
       local frame = menuFrame()
       if not frame or frame.w <= 0 then return false end
-      if not hs.geometry(event:location()):inside(frame) then return false end
+      local loc = event:location()
+      if not hs.geometry(loc):inside(frame) then return false end
+      -- Remember where along the pill the click landed so the menu can offer a
+      -- "Seek to <time>" jump to that position (same mapping as seekToMouse).
+      local seekRatio = math.max(0, math.min(1, (loc.x - frame.x) / frame.w))
       -- Defer to next tick so we don't show UI from inside the eventtap callback.
-      hs.timer.doAfter(0, showRightClickMenu)
+      hs.timer.doAfter(0, function() showRightClickMenu(seekRatio) end)
       return true
     end
     if etype == hs.eventtap.event.types.leftMouseDown then
       cancelHold()
       holdFired = false
+      leftPressed = false
       local frame = menuFrame()
       if not frame or frame.w <= 0 then return false end
       if not hs.geometry(event:location()):inside(frame) then return false end
+      -- Inactive pill is menu-only: no hold-to-seek on a dead player.
+      if not lastRunning then return false end
+      leftPressed = true
       holdTimer = hs.timer.doAfter(HOLD_THRESHOLD_SEC, function()
         holdTimer = nil
         holdFired = true
@@ -384,10 +450,7 @@ module.start = function(deps)
         seekToMouse()
         api.play()
       end)
-    elseif etype == hs.eventtap.event.types.leftMouseDragged and holdFired then
-      if hs.timer.secondsSinceEpoch() - lastSeekTime >= SEEK_THROTTLE_SEC then
-        seekToMouse()
-      end
+      return true
     end
     return false
   end):start()
@@ -405,7 +468,8 @@ module.stop = function()
   timer, pendingClick, mouseDownWatcher, menu, pill = nil, nil, nil, nil, nil
   lastTooltip, lastTrack, lastArtist, lastTrackId = nil, nil, nil, nil
   lastDurMs, holdFired, lastSeekTime, lastPlaying = 0, false, 0, false
-  lastShuffle, lastRunning = false, false
+  leftPressed = false
+  lastShuffle, lastRunning, menuOpen, pendingSeekRatio = false, false, false, nil
   if artCache then artCache.reset() end
   if menuIcons then menuIcons.reset() end
 end

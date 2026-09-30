@@ -8,6 +8,7 @@ package.path = testsDir .. "?.lua;" .. package.path
 _G.hs = require("hs_stub")
 local t = require("helper")
 
+require("pollinterval_spec")
 require("spotify_spec")
 require("applemusic_spec")
 require("interface_spec")

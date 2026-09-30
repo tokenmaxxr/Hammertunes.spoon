@@ -1,6 +1,6 @@
 # Guided Spotify Web API Setup Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For implementation:** Work through the tasks in order and track completion with the checkbox (`- [ ]`) items. Follow the repository's `AGENTS.md` guidance and verify changes with the checks described below.
 
 **Goal:** Let users enable Spotify's optional Web API features through a guided dialog flow from the pill's right-click menu (plus a one-time offer), with no `init.lua` editing or hand-copied IDs.
 

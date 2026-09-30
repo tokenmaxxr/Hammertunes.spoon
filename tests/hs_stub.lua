@@ -43,9 +43,26 @@ hs.json = {
 
 -- application.get: tests set hs.application._running["Music"] = <truthy> to make
 -- the app appear running. Absent by default (apps not running).
+-- applicationsForBundleID is the cheap running-check the Apple Music hot path
+-- uses; it resolves the bundle id back to a name via _bundleNames and reports
+-- the same _running state, so tests keep toggling _running["Music"] as before.
 hs.application = {
   _running = {},
+  _bundleNames = { ["com.apple.Music"] = "Music", ["com.spotify.client"] = "Spotify" },
   get = function(name) return hs.application._running[name] end,
+  applicationsForBundleID = function(bundleID)
+    local name = hs.application._bundleNames[bundleID]
+    local app = name and hs.application._running[name]
+    return app and { app } or {}
+  end,
+}
+
+-- settings: in-memory NSUserDefaults stand-in so persisted prefs (poll interval,
+-- "Show Other Sources") round-trip in tests. Tests can clear hs.settings._store.
+hs.settings = {
+  _store = {},
+  get = function(key) return hs.settings._store[key] end,
+  set = function(key, value) hs.settings._store[key] = value end,
 }
 
 -- osascript: programmable so getState() can be driven end-to-end. Tests assign

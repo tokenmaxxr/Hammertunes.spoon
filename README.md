@@ -9,10 +9,10 @@ A menubar **pill** for [Hammerspoon](https://www.hammerspoon.org/) that shows
 what's playing and lets you control it - artwork, a live progress bar,
 press-and-hold scrubbing, click-zone transport, and a rich right-click menu.
 
-It works with **Spotify** or **Apple Music** (alpha - not tested yet). Most
+It works with **Spotify** or **Apple Music** (beta - basics tested). Most
 people use one or the other, so the setup below is split into two
 self-contained guides - **jump straight to [Spotify](#-spotify) or
-[Apple Music](#-apple-music-alpha)** and follow only that one.
+[Apple Music](#-apple-music-beta)** and follow only that one.
 
 <p align="center">
   <img src="docs/pill.png" alt="The Hammertunes pill in the macOS menubar with its right-click menu open, showing playback controls, shuffle, like, and playlist options" width="720"><br>
@@ -23,18 +23,76 @@ self-contained guides - **jump straight to [Spotify](#-spotify) or
 
 - **Now-playing pill** with album (or playlist) cover art, song/artist, and a
   progress bar that doubles as the menubar item.
-- **Click zones:** left = previous/restart, middle = play/pause, right = next.
-- **Press-and-hold to scrub** to a position; drag to seek.
-- **Double-click** the middle to copy "Song by Artist".
-- **Right-click menu** for shuffle, like/favorite, and playlists. The exact
-  items differ per backend - see each guide below.
+- **Everything is on the pill** - click different parts of it to control
+  playback, or right-click for the full menu. See **[Controls](#controls)**.
+- **Right-click menu** for shuffle, like/favorite, playlists, and settings. The
+  exact items differ per backend - see each guide below.
+
+---
+
+## Controls
+
+There are no keyboard shortcuts to memorize - the pill **is** the control. You
+click different parts of it, or right-click for the full menu.
+
+### The pill
+
+<img src="docs/pill-closeup.png" alt="The Hammertunes pill: album art on the left, the artist name on top, a pause icon and song title below, a dark progress-bar background, and a green heart for a liked track" width="260">
+
+- **Cover art** on the left, the **artist** on the top line, the **play icon +
+  song title** below (**⏸** playing / **▶** paused).
+- The pill's **background is a progress bar** - it fills left → right as the song
+  plays.
+- A **♥** marks a liked/favorite track (Spotify green / Apple Music red).
+- When nothing is playing the pill collapses to a single **♪**, and any click
+  just opens a small menu (open the app / switch backend).
+
+### Click zones
+
+Click a different third of the pill for each transport action:
+
+```
+   [    ◀ Prev    |    ⏸ Play / Pause    |    Next ▶    ]
+        left              center               right
+                    (double-click = copy)
+```
+
+| Gesture | Where on the pill | What it does |
+| --- | --- | --- |
+| **Click** | Left | **Previous** track - or **restart** the current one if you're more than ~3s in |
+| **Click** | Center | **Play / Pause** |
+| **Double-click** | Center | **Copy** "Song by Artist" to the clipboard |
+| **Click** | Right | **Next** track |
+| **Long-click** (press and hold ~1s) | Anywhere | **Seek** the playhead to the spot under your cursor - no drag needed |
+| **Hold, then drag** | Anywhere | **Scrub** - keep dragging after the hold to move the playhead in real time |
+| **⌘-drag** | Anywhere | **Move** the pill to a different spot in the menubar (standard macOS gesture) |
+| **Right-click** | Anywhere | Open the **[right-click menu](#right-click-menu)** |
+
+### Right-click menu
+
+Right-click the pill for everything else. Items are grouped top to bottom, and a
+few differ by backend - the full per-backend lists are under
+[Spotify](#right-click-menu-spotify) and
+[Apple Music](#right-click-menu-apple-music).
+
+- **Transport** - **Previous / Play-Pause / Next**, each labelled with its click
+  zone so you learn the shortcuts, plus **Seek to `M:SS`**: jump the playhead to
+  the exact spot you right-clicked on the pill.
+- **This track** - **Like/Favorite**, **Copy "Song by Artist"**,
+  **Open on YouTube**, **Add to Playlist**.
+- **Play something** - **Shuffle**, **Play Playlist**, **Play Liked Songs**
+  (Spotify), **Show Other Sources** (Apple Music).
+- **Settings** - **Refresh interval** (how often the pill checks the player:
+  1 / 2 / 3 / 5 / 10s; **3s** default, shorter is snappier but uses more battery,
+  so short options are flagged ⚠), **Re-authenticate** / first-time setup,
+  **Update available** (git installs), and **Switch backend**.
 
 ---
 
 ## 🟢 Spotify
 
 > **Read this section if you use Spotify.** It's everything you need, start to
-> finish. (Apple Music users: skip to [Apple Music](#-apple-music-alpha).)
+> finish. (Apple Music users: skip to [Apple Music](#-apple-music-beta).)
 
 ### Requirements
 
@@ -107,9 +165,12 @@ The login is saved to the macOS Keychain, so later launches need only `:start()`
 
 ### Right-click menu (Spotify)
 
-Everything except local shuffle and the backend switch needs the optional Web
-API setup from step 3.
+The transport, seek, copy, shuffle, refresh-interval, and switch items work out
+of the box. The **like**, **Add to Playlist**, **Play Playlist**, and **Play
+Liked Songs** items need the optional Web API setup from step 3.
 
+- **Previous / Play-Pause / Next / Seek to `M:SS`** - transport, mirroring the
+  [click zones](#click-zones).
 - **Shuffle:** Off / Shuffle, plus a read-only **Smart Shuffle** state (Spotify
   owns Smart Shuffle; the pill can show it but not toggle it).
 - **Like / Unlike** the current track.
@@ -119,16 +180,17 @@ API setup from step 3.
   playlists are pinned on top (the only way Discover Weekly / Release Radar show
   up without following them).
 - **Play Liked Songs.**
+- **Refresh interval** - how often the pill polls the player (1 / 2 / 3 / 5 / 10s;
+  3s default, shorter = more battery).
 - **Re-authenticate** (if the token ever needs refreshing).
 - **Switch to Apple Music** - see [Switching backends](#switching-backends).
 
 ---
 
-## 🔴 Apple Music (alpha)
+## 🔴 Apple Music (beta)
 
-> ⚠️ **Alpha - not tested yet.** The Apple Music backend is implemented but
-> hasn't been exercised against a real library; expect rough edges and please
-> [report issues](https://github.com/tokenmaxxr/Hammertunes.spoon/issues).
+> ⚠️ **Beta.** The basics have been tested.
+> [Report issues](https://github.com/tokenmaxxr/Hammertunes.spoon/issues) if you hit any.
 >
 > **Read this section if you use Apple Music.** It's everything you need, start
 > to finish. No account, developer app, or login required.
@@ -175,11 +237,17 @@ That's it - no auth step. (Equivalent: `spoon.Hammertunes:setBackend("applemusic
 
 ### Right-click menu (Apple Music)
 
+- **Previous / Play-Pause / Next / Seek to `M:SS`** - transport, mirroring the
+  [click zones](#click-zones).
 - **Shuffle:** Off / Shuffle (Apple Music has no Smart Shuffle).
 - **Favorite / Unfavorite** the current track.
 - **Copy "Song by Artist"** and **Open on YouTube** for the current track.
 - **Add to Playlist** - your library playlists.
 - **Play Playlist** - your library playlists (no cover thumbnails).
+- **Show Other Sources** - mirror Now Playing from browsers and other apps
+  (MediaRemote is system-wide); off by default, and Spotify is always excluded.
+- **Refresh interval** - how often the pill polls the player (1 / 2 / 3 / 5 / 10s;
+  3s default, shorter = more battery).
 - **Switch to Spotify** - see [Switching backends](#switching-backends).
 
 ### Streaming vs. library tracks
@@ -204,10 +272,10 @@ so you can leave your config as-is and toggle from the menu whenever you like.
 ## Status
 
 - ✅ **Spotify** - transport, state, playlists, like, recently-played, shuffle.
-- ⚠️ **Apple Music (alpha, not tested yet)** - transport, now-playing, artwork
+- ⚠️ **Apple Music (beta)** - transport, now-playing, artwork
   and favorite for library tracks, library playlists, and a MediaRemote fallback
-  for streaming tracks on macOS Tahoe. Implemented but not yet exercised against
-  a real library.
+  for streaming tracks on macOS Tahoe. Basics tested, but not used day to day, so
+  longer use may surface rough edges.
 
 ## Development
 

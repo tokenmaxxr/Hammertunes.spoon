@@ -62,6 +62,10 @@ local module = {}
 --- Authentication
 ---@field authenticate fun(clientId?: string) One-time OAuth setup; may be a no-op (Apple Music)
 ---
+--- Poll interval (shared across backends; backs the right-click "Refresh interval")
+---@field getPollInterval fun(): number Seconds between the expensive AppleScript now-playing reads
+---@field setPollInterval fun(sec: number) Persist the shared poll interval; shorter is more responsive but uses more battery
+---
 --- OPTIONAL — nil means the backend doesn't support it; menu/controller gates
 --- on truthiness before calling these.
 ---
@@ -72,6 +76,9 @@ local module = {}
 ---@field supportsSmartShuffle boolean|nil Backend exposes a read-only Smart Shuffle state
 ---@field supportsReauth boolean|nil "Switch account" re-auth is available for this backend
 ---@field likedColor table|nil Accent colour for the heart icon: {red, green, blue}
+---@field supportsSourceToggle boolean|nil Backend exposes the "Show Other Sources" toggle (Apple Music; MediaRemote is system-wide)
+---@field getShowOtherSources fun(): boolean|nil Whether non-backend apps' Now Playing may drive the pill
+---@field setShowOtherSources fun(on: boolean)|nil Persist the "Show Other Sources" preference and re-probe
 
 -- ---------------------------------------------------------------------------
 -- Runtime verifier
@@ -107,6 +114,8 @@ local REQUIRED = {
   playpause            = "function",
   play                 = "function",
   authenticate         = "function",
+  getPollInterval      = "function",
+  setPollInterval      = "function",
 }
 
 -- verify(backend, name) checks every required member. On success returns the

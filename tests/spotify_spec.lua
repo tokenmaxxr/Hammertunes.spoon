@@ -105,14 +105,75 @@ end)
 -- (fail-closed) stub afterwards so state does not leak between tests.
 -- ---------------------------------------------------------------------------
 
--- Sentinel restores the default fail-closed stub after each test.
+-- Sentinel restores the default fail-closed stub after each test. Marks Spotify
+-- as running so getState() passes its applicationsForBundleID gate, and advances
+-- the clock past POLL_INTERVAL_SEC so getState() does a real read instead of
+-- serving a throttled snapshot left over from a prior test.
 local function withApplescript(fn, body)
   local prev = hs.osascript._applescript
   hs.osascript._applescript = fn
+  hs.application._running["Spotify"] = true
+  hs.timer._now = hs.timer._now + 1000
   local ok, err = pcall(body)
+  hs.application._running["Spotify"] = nil
   hs.osascript._applescript = prev
   if not ok then error(err, 2) end
 end
+
+t.test("spotify: interpolate advances a playing snapshot, leaving the original", function()
+  local snap = { running = true, playing = true, durMs = 100000, progress = 0.1, track = "x" }
+  local out = spotify._test.interpolate(snap, 5) -- +5s of a 100s track -> 15/100
+  t.ok(math.abs(out.progress - 0.15) < 1e-9, "progress advanced by 5s")
+  t.eq(snap.progress, 0.1) -- cached snapshot untouched
+end)
+
+t.test("spotify: interpolate leaves paused / zero-duration snapshots unchanged", function()
+  local paused = { playing = false, durMs = 100000, progress = 0.2 }
+  t.eq(spotify._test.interpolate(paused, 10), paused)
+  local nodur = { playing = true, durMs = 0, progress = 0 }
+  t.eq(spotify._test.interpolate(nodur, 10), nodur)
+end)
+
+t.test("spotify: interpolate clamps at the end of the track", function()
+  local snap = { playing = true, durMs = 10000, progress = 0.95 } -- 9.5s of 10s
+  t.eq(spotify._test.interpolate(snap, 5).progress, 1) -- 14.5/10 -> clamped
+end)
+
+t.test("spotify: getState throttles the osascript read and interpolates between", function()
+  hs.application._running["Spotify"] = true
+  local prev = hs.osascript._applescript
+  local calls = 0
+  hs.osascript._applescript = function(_)
+    calls = calls + 1
+    -- playing, pos=10s, dur=100000ms (100s) -> progress 0.1
+    return true, table.concat(
+      { "playing", "T", "A", "10", "100000", "", "spotify:track:X", "false" }, "\t")
+  end
+  hs.timer._now = 1000
+  local s1 = spotify.getState()          -- real read at t=1000
+  t.eq(calls, 1)
+  t.ok(math.abs(s1.progress - 0.1) < 1e-9, "fresh read is not interpolated")
+  hs.timer._now = 1002                    -- +2s, within POLL_INTERVAL_SEC (3)
+  local s2 = spotify.getState()          -- served from snapshot, no new read
+  t.eq(calls, 1)
+  t.ok(math.abs(s2.progress - 0.12) < 1e-9, "progress interpolated +2s")
+  hs.timer._now = 1004                    -- +4s from the read, past the interval
+  spotify.getState()                      -- real read again
+  t.eq(calls, 2)
+  hs.osascript._applescript = prev
+  hs.application._running["Spotify"] = nil
+end)
+
+t.test("spotify: getState - Spotify not running skips osascript, returns not-running", function()
+  hs.application._running["Spotify"] = nil
+  local called = false
+  local prev = hs.osascript._applescript
+  hs.osascript._applescript = function(_) called = true; return true, "" end
+  local s = spotify.getState()
+  hs.osascript._applescript = prev
+  t.eq(s, { running = false })
+  t.ok(not called, "osascript must not run when Spotify is closed")
+end)
 
 t.test("spotify: getState - osascript fails outright returns not-running", function()
   -- Simulates the case where hs.osascript.applescript itself returns failure

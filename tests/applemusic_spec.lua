@@ -91,6 +91,52 @@ t.test("applemusic: mrState maps empty title/artist to nil and rate 0 to paused"
   t.eq(s.shuffle, false)
 end)
 
+t.test("applemusic: mrState folds a foreign source into the artist line", function()
+  hs.timer._now = 0
+  local base = { title = "T", artist = "A", duration = 100, elapsed = 0, rate = 1 }
+  t.eq(T.mrState(base, false, nil, "Safari").artist, "A · via Safari")
+  -- No artist: the label stands alone so the source is still clear.
+  local noArtist = { title = "T", artist = "", duration = 100, elapsed = 0, rate = 1 }
+  t.eq(T.mrState(noArtist, false, nil, "Safari").artist, "via Safari")
+end)
+
+-- ---------------------------------------------------------------------------
+-- mrSourceLabel - which Now Playing sources may drive the Apple Music pill
+-- ---------------------------------------------------------------------------
+
+t.test("applemusic: mrSourceLabel always accepts Apple Music with no label", function()
+  T.resetArtState()  -- showOtherSources = false
+  local ok, label = T.mrSourceLabel({ bundleId = "com.apple.Music", appName = "Music" })
+  t.eq(ok, true)
+  t.eq(label, nil)
+end)
+
+t.test("applemusic: mrSourceLabel always rejects Spotify (own backend)", function()
+  T.resetArtState()
+  am.setShowOtherSources(true)  -- even with the toggle on
+  local ok = T.mrSourceLabel({ bundleId = "com.spotify.client", appName = "Spotify" })
+  t.eq(ok, false)
+  am.setShowOtherSources(false)
+end)
+
+t.test("applemusic: mrSourceLabel hides other apps by default, shows+labels when opted in", function()
+  T.resetArtState()
+  local ok = T.mrSourceLabel({ bundleId = "com.apple.Safari", appName = "Safari" })
+  t.eq(ok, false)  -- default off
+  am.setShowOtherSources(true)
+  local ok2, label = T.mrSourceLabel({ bundleId = "com.apple.Safari", appName = "Safari" })
+  t.eq(ok2, true)
+  t.eq(label, "Safari")
+  am.setShowOtherSources(false)
+end)
+
+t.test("applemusic: mrSourceLabel fails open for an unknown (missing) source", function()
+  T.resetArtState()
+  local ok, label = T.mrSourceLabel({ title = "T" })  -- no bundleId
+  t.eq(ok, true)
+  t.eq(label, nil)
+end)
+
 -- ---------------------------------------------------------------------------
 -- runningState
 -- ---------------------------------------------------------------------------
@@ -216,6 +262,18 @@ t.test("applemusic: getState returns {running=false} when Music is not running",
   resetStubs()
 end)
 
+-- A bare `tell application "Music"` relaunches Music (even mid-quit), so every
+-- script that fires on its own must guard on `is running`. refreshPlaylists runs
+-- on Spoon start and every menu open — the most common relaunch vector.
+t.test("applemusic: refreshPlaylists guards on `is running` (never relaunches Music)", function()
+  local captured
+  hs.osascript._applescript = function(s) captured = s; return true, "" end
+  am.refreshPlaylists()
+  t.ok(captured and captured:find('application "Music" is running', 1, true),
+    "playlist script must guard on `is running` so a bare tell never relaunches Music")
+  resetStubs()
+end)
+
 -- ---------------------------------------------------------------------------
 -- getState: library track with embedded artwork (exportArt succeeds)
 -- ---------------------------------------------------------------------------
@@ -286,6 +344,57 @@ t.test("applemusic: getState falls back to MediaRemote URL when library art is e
   t.eq(s2.artUrl, COVER)
   t.eq(execCalls, 0)
 
+  resetStubs()
+end)
+
+-- ---------------------------------------------------------------------------
+-- Library-path throttle + interpolation (the energy fix): MUSIC_QUERY runs at
+-- most once per interval; the progress bar advances locally in between.
+-- ---------------------------------------------------------------------------
+
+t.test("applemusic: interpolateAsState advances a playing snapshot, leaving the original", function()
+  local snap = { running = true, playing = true, durMs = 100000, progress = 0.1, track = "x" }
+  local out = T.interpolateAsState(snap, 5) -- +5s of a 100s track -> 15/100
+  t.ok(math.abs(out.progress - 0.15) < 1e-9, "progress advanced by 5s")
+  t.eq(snap.progress, 0.1) -- cached snapshot untouched
+end)
+
+t.test("applemusic: interpolateAsState leaves paused / zero-duration snapshots unchanged", function()
+  local paused = { playing = false, durMs = 100000, progress = 0.2 }
+  t.eq(T.interpolateAsState(paused, 10), paused)
+  local nodur = { playing = true, durMs = 0, progress = 0 }
+  t.eq(T.interpolateAsState(nodur, 10), nodur)
+end)
+
+t.test("applemusic: getState throttles MUSIC_QUERY and interpolates between reads", function()
+  T.resetArtState()
+  hs.application._running["Music"] = true
+  local mqCalls = 0
+  hs.osascript._applescript = function(script)
+    if script:find("set s to player state", 1, true) then
+      mqCalls = mqCalls + 1
+      -- playing library track: dur=100s, pos=10s -> progress 0.1, trackId 4242.
+      return true, "OK\tplaying\tfalse\tSong\tArtist\t4242\t100\t10\tfalse"
+    end
+    return true, "" -- exportArt / shuffle / others: harmless empty result
+  end
+  hs._exec = function(_) return "" end
+
+  hs.timer._now = 1000
+  local s1 = am.getState()                 -- real read at t=1000
+  t.eq(mqCalls, 1)
+  t.eq(s1.track, "Song")
+  t.ok(math.abs(s1.progress - 0.1) < 1e-9, "fresh read is not interpolated")
+
+  hs.timer._now = 1002                      -- +2s, within AS_POLL_INTERVAL_SEC (3)
+  local s2 = am.getState()                  -- served from snapshot, no MUSIC_QUERY
+  t.eq(mqCalls, 1)
+  t.eq(s2.track, "Song")
+  t.ok(math.abs(s2.progress - 0.12) < 1e-9, "progress interpolated +2s")
+
+  hs.timer._now = 1004                       -- +4s from the read, past the interval
+  am.getState()                              -- real read again
+  t.eq(mqCalls, 2)
   resetStubs()
 end)
 

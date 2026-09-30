@@ -16,6 +16,14 @@
 local module = {}
 local log = hs.logger.new("hammertunes.spotify", "info")
 
+-- Shared sibling modules (loaded by path derived from this file's own location,
+-- so they resolve the same way under init.lua and the test harness). poll owns
+-- the user-configurable poll interval; prog owns progress math shared with the
+-- Apple Music backend. See backends/pollinterval.lua and backends/progress.lua.
+local siblingDir = debug.getinfo(1, "S").source:gsub("^@", ""):gsub("[^/\\]+$", "")
+local poll = dofile(siblingDir .. "pollinterval.lua")
+local prog = dofile(siblingDir .. "progress.lua")
+
 local SERVICE = "Hammertunes"
 local REDIRECT_URI = "http://127.0.0.1:53127/callback"
 local AUTH_PORT = 53127
@@ -867,10 +875,7 @@ local function parseSpotifyState(result)
     result:match("^([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t(.*)$")
   local posSec = tonumber(pos) or 0
   local durMs = tonumber(dur) or 0
-  local progress = 0
-  if durMs > 0 then
-    progress = math.max(0, math.min(1, posSec / (durMs / 1000)))
-  end
+  local progress = prog.calcProgress(posSec, durMs)
   -- Bare ID only — Web API endpoints (/v1/me/tracks*) want the ID, not the URI.
   -- Local files come through as "spotify:local:..." which the API rejects, so
   -- limit to real track IDs.
@@ -889,25 +894,74 @@ local function parseSpotifyState(result)
   }
 end
 
+-- Bundle id for the cheap is-running gate below. Spotify's own app bundle.
+local SPOTIFY_BUNDLE = "com.spotify.client"
+
+-- The SPOTIFY_QUERY AppleScript is expensive (~150 ms: macOS recompiles it and
+-- runs an XProtect malware scan on every call, plus the Apple Event round-trip),
+-- so running it on every 1 Hz render tick was the dominant energy cost. Instead
+-- we read it at most once per poll.get() seconds and serve a locally-interpolated
+-- snapshot in between: the progress bar still advances every tick, while a track
+-- or play/pause change is picked up on the next real read. Mirrors the Apple
+-- Music backend's MediaRemote snapshot/interpolation.
+--
+-- The interval is user-configurable (right-click "Refresh interval") and shared
+-- with the Apple Music backend via backends/pollinterval.lua, so the choice
+-- applies consistently whichever backend is active. We load that module as a
+-- sibling — its path derived from this file's own location, so it resolves the
+-- same way under init.lua and the test harness (both dofile backends by path).
+module.getPollInterval = poll.get
+module.setPollInterval = poll.set
+
+local stateSnapshot = nil   -- last parsed state table from a real read
+local stateSnapshotAt = 0   -- secondsSinceEpoch of that read (0 forces a re-read)
+
+-- Force the next getState() to do a real read instead of interpolating. Called
+-- after transport mutations so a user action (play/pause, skip, seek) shows up
+-- immediately rather than after the current poll interval elapses.
+local function invalidateSnapshot() stateSnapshotAt = 0 end
+
 module.getState = function()
-  local ok, result = hs.osascript.applescript(SPOTIFY_QUERY)
-  if not ok or type(result) ~= "string" or result == "" then
+  -- Skip the AppleScript entirely when Spotify isn't running. Every
+  -- hs.osascript.applescript call recompiles the script AND triggers an XProtect
+  -- malware scan (tens of ms each); at 1 Hz, 24/7, that was ~2% CPU even with
+  -- Spotify closed (the in-script "is running" guard returned early, but the
+  -- compile + scan were already paid). applicationsForBundleID is ~0.01 ms. The
+  -- in-script guard still covers the running->closed race within a tick.
+  if #hs.application.applicationsForBundleID(SPOTIFY_BUNDLE) == 0 then
+    stateSnapshot = nil
     return { running = false }
   end
-  return parseSpotifyState(result)
+  -- Serve an interpolated snapshot between throttled reads.
+  local now = hs.timer.secondsSinceEpoch()
+  local elapsed = now - stateSnapshotAt
+  if stateSnapshot and elapsed < poll.get() then
+    return prog.interpolate(stateSnapshot, elapsed)
+  end
+  local ok, result = hs.osascript.applescript(SPOTIFY_QUERY)
+  if not ok or type(result) ~= "string" or result == "" then
+    stateSnapshot = nil
+    return { running = false }
+  end
+  stateSnapshot = parseSpotifyState(result)
+  stateSnapshotAt = now
+  return stateSnapshot
 end
 
-module.next = function() hs.spotify.next() end
-module.previous = function() hs.spotify.previous() end
-module.playpause = function() hs.spotify.playpause() end
-module.play = function() hs.spotify.play() end
+-- Transport mutators invalidate the cached snapshot so the change shows on the
+-- next render rather than after the poll interval (see invalidateSnapshot).
+module.next = function() hs.spotify.next(); invalidateSnapshot() end
+module.previous = function() hs.spotify.previous(); invalidateSnapshot() end
+module.playpause = function() hs.spotify.playpause(); invalidateSnapshot() end
+module.play = function() hs.spotify.play(); invalidateSnapshot() end
 module.getPosition = function() return hs.spotify.getPosition() end
-module.setPosition = function(sec) hs.spotify.setPosition(sec) end
+module.setPosition = function(sec) hs.spotify.setPosition(sec); invalidateSnapshot() end
 -- AppleScript toggles shuffle on the local app synchronously and without Web API
 -- auth. It can't exit Spotify's real Smart Shuffle (a platform limitation), which
 -- the menu reflects by showing Smart Shuffle as read-only.
 module.setShuffling = function(on)
   hs.osascript.applescript('tell application "Spotify" to set shuffling to ' .. tostring(on))
+  invalidateSnapshot()
 end
 
 module.appName = "Spotify"
@@ -921,6 +975,7 @@ module._test = {
   parseSpotifyState = parseSpotifyState,
   parseRetryAfter = parseRetryAfter,
   singleFlight = singleFlight,
+  interpolate = prog.interpolate,
 }
 
 module.getName = function() return currentName end
@@ -1003,6 +1058,7 @@ module.setupLabel = "Enable Spotify extras…"
 
 module.start = function(changeCallback)
   onChange = changeCallback
+  poll.load()
   loadCreds()
   loadPlaylistsCache()
   if needsSetup() then
