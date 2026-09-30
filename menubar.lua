@@ -154,7 +154,7 @@ local function prewarmMenuIcons()
   end
 end
 
-local function setPill(text, progress, subtitle, artUrl, artPath, liked)
+local function setPill(text, progress, subtitle, artUrl, artPath, liked, holdWidth)
   local art = ensureArt(artUrl, artPath)
   local artKey = artUrl or artPath
   pill.update(text, {
@@ -162,7 +162,9 @@ local function setPill(text, progress, subtitle, artUrl, artPath, liked)
     subtitle = subtitle,
     leadingImage = art or nil,
     leadingImageKey = art and artKey or nil,
-    likedOverlay = liked == true and art ~= nil,
+    reserveLeadingImage = artKey ~= nil,
+    holdWidth = holdWidth,
+    likedOverlay = liked == true and artKey ~= nil,
     -- Heart accent comes from the active backend (Spotify green / Apple Music red).
     likedColor = api and api.likedColor or nil,
   })
@@ -206,7 +208,9 @@ render = function()
     local liked = api and api.getLiked() == true
     setPill(main, s.progress, subtitle, s.artUrl, s.artPath, liked)
   else
-    setPill("♪")
+    -- Players can briefly report no track between songs. Keep the occupied
+    -- menubar space until the next title supplies its final dimensions.
+    setPill("♪", nil, nil, nil, nil, nil, true)
   end
   -- Tooltips have no padding control; fake margins with blank lines/leading spaces.
   local PAD = "  "
@@ -265,6 +269,7 @@ local function seekToMouse()
   local ratio = math.max(0, math.min(1, relX / frame.w))
   api.setPosition(ratio * (lastDurMs / 1000))
   lastSeekTime = hs.timer.secondsSinceEpoch()
+  scheduleRender()
 end
 
 local function onLeftClick()

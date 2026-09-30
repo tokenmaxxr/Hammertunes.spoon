@@ -79,12 +79,16 @@ local function withGestures(fn)
   local state = { running = true, playing = true, track = "Song", artist = "Artist",
     trackId = "song", durMs = 200000, progress = 0.1 }
   local renderCount = 0
+  local lastPill
   local menuContext
   local ok, err = pcall(function()
     subject = t.loadModule("menubar.lua")
     local noop = function() end
     subject.start({
-      pill = { new = function() return { update = function() renderCount = renderCount + 1 end } end },
+      pill = { new = function() return { update = function(text, opts)
+        renderCount = renderCount + 1
+        lastPill = { text = text, opts = opts }
+      end } end },
       images = { newCache = function()
         return { getPath = noop, getUrl = noop, reset = noop }
       end },
@@ -111,6 +115,7 @@ local function withGestures(fn)
     })
     local harness = { calls = calls, stop = subject.stop, state = state,
       renders = function() return renderCount end, timers = timers,
+      pill = function() return lastPill end,
       menuContext = function() return menuContext end }
     function harness.advance(seconds)
       local target = now + seconds
@@ -148,6 +153,27 @@ local function withGestures(fn)
   if not ok then error(err, 0) end
 end
 
+t.test("menubar: reserve pending cover space and hold width only during running track gaps", function()
+  withGestures(function(h)
+    h.state.artUrl = "https://example.test/cover.jpg"
+    h.advance(1)
+    t.eq(h.pill().opts.reserveLeadingImage, true)
+    t.eq(h.pill().opts.leadingImage, nil)
+    h.state.track = nil
+    h.advance(1)
+    t.eq(h.pill().text, "♪")
+    t.eq(h.pill().opts.holdWidth, true)
+    h.state.track = "Next"
+    h.advance(1)
+    t.eq(h.pill().opts.holdWidth, nil)
+    h.state.running = false
+    h.advance(1)
+    t.eq(h.pill().text, "♪")
+    t.eq(h.pill().opts.holdWidth, nil)
+    t.eq(h.pill().opts.reserveLeadingImage, false)
+  end)
+end)
+
 t.test("menubar: owned hold seeks to relative position and suppresses release click", function()
   withGestures(function(h)
     t.eq(h.event("leftMouseDown", 175), true)
@@ -158,6 +184,22 @@ t.test("menubar: owned hold seeks to relative position and suppresses release cl
     t.eq(h.event("leftMouseUp"), true)
     h.advance(0.3)
     t.eq(h.calls, { { "seek", 150 }, { "play" } })
+  end)
+end)
+
+t.test("menubar: scrub refreshes before release without changing the regular timer", function()
+  withGestures(function(h)
+    h.event("leftMouseDown", 150)
+    h.advance(1)
+    local before = h.renders()
+    h.advance(0.21)
+    t.eq(h.renders(), before + 1)
+    h.event("leftMouseDragged", 175)
+    h.advance(0.21)
+    t.eq(h.renders(), before + 2)
+    for _, timer in ipairs(h.timers) do
+      if timer.repeating then t.eq(timer.repeating, 1) end
+    end
   end)
 end)
 

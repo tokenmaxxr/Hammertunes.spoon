@@ -21,7 +21,7 @@ local obj = {}
 obj.__index = obj
 
 obj.name = "Hammertunes"
-obj.version = "0.1.1"
+obj.version = "0.1.2"
 obj.author = "tokenmaxxr"
 obj.homepage = "https://github.com/tokenmaxxr/Hammertunes.spoon"
 obj.license = "MIT - https://opensource.org/licenses/MIT"

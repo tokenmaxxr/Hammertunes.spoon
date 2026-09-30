@@ -14,6 +14,7 @@ require("applemusic_spec")
 require("interface_spec")
 require("init_spec")
 require("menubar_spec")
+require("pill_spec")
 require("rightclick_spec")
 require("images_spec")
 

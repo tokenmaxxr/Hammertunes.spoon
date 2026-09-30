@@ -44,7 +44,8 @@ module.image = function(text, opts)
   local artSize = opts.artSize or (h - 6)
   local artRadius = opts.artRadius or 3
   local artGap = opts.artGap or 6
-  local leadingW = leadingImage and (artSize + artGap) or 0
+  -- The cover dimensions are known before its asynchronous download finishes.
+  local leadingW = (leadingImage or opts.reserveLeadingImage) and (artSize + artGap) or 0
 
   local heartStyled, heartW, heartH = nil, 0, 0
   if opts.likedOverlay then
@@ -62,7 +63,7 @@ module.image = function(text, opts)
   local heartGap = heartStyled and (opts.likedGap or 4) or 0
   local subRowW = (subW or 0) + (heartStyled and (heartGap + heartW) or 0)
   local innerW = math.max(mainW, subRowW)
-  local w = leadingW + innerW + opts.padX * 2
+  local w = opts.width or (leadingW + innerW + opts.padX * 2)
   local canvas = hs.canvas.new({ x = 0, y = 0, w = w, h = h })
 
   local progress = opts.progress
@@ -145,7 +146,7 @@ module.image = function(text, opts)
 
   local img = canvas:imageFromCanvas()
   canvas:delete()
-  return img
+  return img, w
 end
 
 -- Stateful wrapper around a menubar item: quantizes progress, caches the last
@@ -154,28 +155,35 @@ module.new = function(menu, baseOpts, opts)
   opts = opts or {}
   local progressSteps = opts.progressSteps or 100
   local lastKey = nil
+  local lastWidth = nil
 
   local function update(text, renderOpts)
     renderOpts = renderOpts or {}
     local progress = renderOpts.progress
     local step = progress and math.floor(progress * progressSteps + 0.5) or 0
     local progressQ = progress and step / progressSteps or nil
-    local key = string.format("%s|%d|%s|%s|%s",
+    local key = string.format("%s|%d|%s|%s|%s|%s|%s",
       text, step, tostring(renderOpts.subtitle or ""), renderOpts.leadingImageKey or "",
-      renderOpts.likedOverlay and "1" or "0")
+      renderOpts.likedOverlay and "1" or "0",
+      renderOpts.reserveLeadingImage and "1" or "0", renderOpts.holdWidth and "1" or "0")
     if key == lastKey then return end
     lastKey = key
-    menu:setIcon(module.image(text, merge(baseOpts, {
+    local img, width = module.image(text, merge(baseOpts, {
       progress = progressQ,
       subtitle = renderOpts.subtitle,
       leadingImage = renderOpts.leadingImage,
+      reserveLeadingImage = renderOpts.reserveLeadingImage,
+      width = renderOpts.holdWidth and lastWidth or nil,
       likedOverlay = renderOpts.likedOverlay,
       likedColor = renderOpts.likedColor,
-    })), false)
+    }))
+    lastWidth = width
+    menu:setIcon(img, false)
   end
 
   local function reset()
     lastKey = nil
+    lastWidth = nil
   end
 
   return { update = update, reset = reset }
