@@ -136,14 +136,15 @@ local function withGestures(fn)
       end
       now = target
     end
-    function harness.event(kind, x, flags)
-      mouse = { x = x or mouse.x, y = 10 }
+    function harness.event(kind, x, flags, globalX)
+      local location = { x = x or mouse.x, y = 10 }
+      mouse = { x = globalX or location.x, y = 10 }
       local eventType = types[kind]
       if watcher.stopped or not watcher.subscriptions[eventType] then return false end
       return watcher.callback({
         getType = function() return eventType end,
         getFlags = function() return flags or {} end,
-        location = function() return mouse end,
+        location = function() return location end,
       })
     end
     fn(harness)
@@ -219,6 +220,27 @@ t.test("menubar: drag seeks are throttled and clamped until release", function()
     h.advance(0.2)
     t.eq(h.event("leftMouseDragged", 150), false)
     t.eq(#h.calls, 4)
+  end)
+end)
+
+t.test("menubar: repeated scrubs use event positions and flush the final throttled move", function()
+  withGestures(function(h)
+    for _, startX in ipairs({ 125, 150 }) do
+      local first = #h.calls + 1
+      h.event("leftMouseDown", startX)
+      h.event("leftMouseDragged", 160, nil, startX)
+      h.advance(1)
+      t.eq(h.calls[first], { "seek", 120 })
+      h.advance(0.11)
+      h.event("leftMouseDragged", 175, nil, startX)
+      t.eq(h.calls[first + 2], { "seek", 150 })
+      h.event("leftMouseDragged", 180, nil, startX)
+      t.eq(#h.calls, first + 2)
+      h.event("leftMouseUp", 185, nil, startX)
+      t.eq(h.calls[first + 3], { "seek", 170 })
+      h.advance(0.3)
+      t.eq(#h.calls, first + 3)
+    end
   end)
 end)
 

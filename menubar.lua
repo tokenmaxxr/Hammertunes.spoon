@@ -52,6 +52,8 @@ local holdTimer = nil
 local holdFired = false
 local leftPressed = false
 local gestureSnapshot = nil
+local gestureLocation = nil
+local lastSeekRatio = nil
 local lastSeekTime = 0
 local mouseDownWatcher = nil
 local lastPlaying = false
@@ -265,9 +267,14 @@ local function seekToMouse()
   if gestureSnapshot and not sameTrack(gestureSnapshot) then return end
   local frame = menuFrame()
   if not frame or frame.w <= 0 or lastDurMs <= 0 then return end
-  local relX = hs.mouse.absolutePosition().x - frame.x
+  -- Consumed drag events can precede the global cursor update. Use the
+  -- position from the owned gesture, including moves before the hold fires.
+  if not gestureLocation then return end
+  local relX = gestureLocation.x - frame.x
   local ratio = math.max(0, math.min(1, relX / frame.w))
+  if ratio == lastSeekRatio then return end
   api.setPosition(ratio * (lastDurMs / 1000))
+  lastSeekRatio = ratio
   lastSeekTime = hs.timer.secondsSinceEpoch()
   scheduleRender()
 end
@@ -474,6 +481,8 @@ module.start = function(deps)
       leftPressed = false
       cancelHold()
       if holdFired then
+        gestureLocation = event:location()
+        seekToMouse()
         holdFired = false
         scheduleRender()
       else
@@ -491,6 +500,7 @@ module.start = function(deps)
       return true
     end
     if etype == hs.eventtap.event.types.leftMouseDragged and leftPressed then
+      gestureLocation = event:location()
       if holdFired and hs.timer.secondsSinceEpoch() - lastSeekTime >= SEEK_THROTTLE_SEC then
         seekToMouse()
       end
@@ -521,6 +531,8 @@ module.start = function(deps)
       -- Inactive pill is menu-only: no hold-to-seek on a dead player.
       if not lastRunning then return false end
       leftPressed = true
+      gestureLocation = event:location()
+      lastSeekRatio = nil
       local snapshot = lastState
       gestureSnapshot = snapshot
       holdTimer = defer(HOLD_THRESHOLD_SEC, function()
