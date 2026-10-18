@@ -182,6 +182,9 @@ Use the command matching your installation:
 brew upgrade --cask hammertunes
 ```
 
+After upgrading, reload Hammerspoon via **menu bar > Reload Config** to load
+the new code.
+
 ```sh
 git -C ~/.hammerspoon/Spoons/Hammertunes.spoon pull
 ```
