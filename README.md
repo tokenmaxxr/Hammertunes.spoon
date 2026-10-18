@@ -71,6 +71,10 @@ Click a different third of the pill for each transport action:
 
 ### Right-click menu
 
+Hover over the pill for about 0.6 seconds to see the full track, artist, and
+available source or playlist information. The tooltip closes when you move away
+or click; move away and hover again to reopen it.
+
 Right-click the pill for everything else. Items are grouped top to bottom, and a
 few differ by backend - the full per-backend lists are under
 [Spotify](#right-click-menu-spotify) and

@@ -23,7 +23,7 @@ end)
 -- event-consumption contract, without depending on native status-item tracking.
 local function withGestures(fn)
   local savedHs = hs
-  local timers, calls = {}, {}
+  local timers, calls, tooltips = {}, {}, {}
   local now, mouse, watcher = 0, { x = 150, y = 10 }, nil
   local types = {
     leftMouseDown = 1, leftMouseUp = 2, leftMouseDragged = 3, rightMouseDown = 4,
@@ -56,7 +56,26 @@ local function withGestures(fn)
           and point.y >= frame.y and point.y < frame.y + frame.h
       end } })
     end,
-    mouse = { absolutePosition = function() return mouse end },
+    mouse = { absolutePosition = function() return mouse end,
+      getCurrentScreen = function() return { fullFrame = function()
+        return { x = 0, y = 0, w = 1000, h = 1000 }
+      end } end },
+    drawing = { getTextDrawingSize = function(text, style)
+      -- hs.drawing uses a flat style, unlike hs.styledtext's nested font table.
+      assert(type(style.font) == "string", "drawing font must be a name")
+      assert(style.size == 13, "measure at the tooltip's rendered text size")
+      return { w = #text * 7, h = 16 }
+    end },
+    canvas = { new = function(frame)
+      local canvas = { frame = frame }
+      function canvas:level() end
+      function canvas:behaviorAsLabels() end
+      function canvas:appendElements(_, element) self.text = element.text end
+      function canvas:show() self.visible = true end
+      function canvas:delete() self.visible = false end
+      tooltips[#tooltips + 1] = canvas
+      return canvas
+    end },
     timer = {
       doAfter = function(delay, callback) return newTimer(delay, callback) end,
       doEvery = function(delay, callback) return newTimer(delay, callback, delay) end,
@@ -116,7 +135,8 @@ local function withGestures(fn)
     local harness = { calls = calls, stop = subject.stop, state = state,
       renders = function() return renderCount end, timers = timers,
       pill = function() return lastPill end,
-      menuContext = function() return menuContext end }
+      menuContext = function() return menuContext end, tooltips = tooltips,
+      move = function(x) mouse = { x = x, y = 10 } end }
     function harness.advance(seconds)
       local target = now + seconds
       while true do
@@ -154,6 +174,54 @@ local function withGestures(fn)
   if not ok then error(err, 0) end
 end
 
+t.test("menubar: hover shows full metadata and survives progress redraws", function()
+  withGestures(function(h)
+    h.advance(0.5)
+    t.eq(#h.tooltips, 0)
+    h.advance(0.4)
+    t.eq(#h.tooltips, 1)
+    local popup = h.tooltips[1]
+    t.ok(popup.visible)
+    t.ok(popup.text:find("Song", 1, true))
+    t.ok(popup.text:find("Artist", 1, true))
+    h.state.progress = 0.8
+    h.advance(2)
+    t.eq(#h.tooltips, 1)
+    t.ok(popup.visible)
+    h.move(250)
+    h.advance(0.2)
+    t.eq(popup.visible, false)
+    h.move(150)
+    h.advance(0.9)
+    t.eq(#h.tooltips, 2)
+  end)
+end)
+
+t.test("menubar: hover refreshes metadata and click suppresses it until exit", function()
+  withGestures(function(h)
+    h.advance(0.9)
+    h.state.track = "A new full title"
+    h.advance(1)
+    t.eq(h.tooltips[1].visible, false)
+    t.ok(h.tooltips[#h.tooltips].text:find("A new full title", 1, true))
+    h.event("leftMouseDown", 150)
+    t.eq(h.tooltips[#h.tooltips].visible, false)
+    h.event("leftMouseUp", 150)
+    local count = #h.tooltips
+    h.advance(2)
+    t.eq(#h.tooltips, count)
+    h.move(250)
+    h.advance(0.2)
+    h.move(150)
+    h.advance(0.9)
+    t.ok(h.tooltips[#h.tooltips].visible)
+    h.stop()
+    t.eq(h.tooltips[#h.tooltips].visible, false)
+    h.advance(2)
+    t.eq(#h.tooltips, count + 1)
+  end)
+end)
+
 t.test("menubar: reserve pending cover space and hold width only during running track gaps", function()
   withGestures(function(h)
     h.state.artUrl = "https://example.test/cover.jpg"
@@ -190,6 +258,10 @@ end)
 
 t.test("menubar: scrub refreshes before release without changing the regular timer", function()
   withGestures(function(h)
+    local repeating = {}
+    for _, timer in ipairs(h.timers) do
+      if timer.repeating then repeating[timer] = timer.repeating end
+    end
     h.event("leftMouseDown", 150)
     h.advance(1)
     local before = h.renders()
@@ -199,7 +271,7 @@ t.test("menubar: scrub refreshes before release without changing the regular tim
     h.advance(0.21)
     t.eq(h.renders(), before + 2)
     for _, timer in ipairs(h.timers) do
-      if timer.repeating then t.eq(timer.repeating, 1) end
+      if timer.repeating then t.eq(timer.repeating, repeating[timer]) end
     end
   end)
 end)

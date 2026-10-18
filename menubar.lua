@@ -44,6 +44,8 @@ local pill = nil
 local timer = nil
 local pendingClick = nil
 local lastTooltip = nil
+local hoverTimer, hoverSince, tooltipCanvas, visibleTooltip
+local hoverDismissed = false
 local lastTrack = nil
 local lastArtist = nil
 local lastTrackId = nil
@@ -172,10 +174,60 @@ local function setPill(text, progress, subtitle, artUrl, artPath, liked, holdWid
   })
 end
 
+local function hideTooltip()
+  if tooltipCanvas then tooltipCanvas:delete() end
+  tooltipCanvas, visibleTooltip, hoverSince = nil, nil, nil
+end
+
+-- Native status-item tooltips depend on AppKit tracking while we continually
+-- replace the progress icon. Keep hover timing independent of those redraws.
+local function updateTooltip()
+  local frame = menuFrame()
+  local mouse = hs.mouse.absolutePosition()
+  if not frame or not hs.geometry(mouse):inside(frame) then
+    hideTooltip()
+    hoverDismissed = false
+    return
+  end
+  if hoverDismissed or leftPressed or menuOpen or not lastTooltip then
+    hideTooltip()
+    return
+  end
+  local now = hs.timer.secondsSinceEpoch()
+  hoverSince = hoverSince or now
+  if now - hoverSince < 0.6 or visibleTooltip == lastTooltip then return end
+  hideTooltip()
+  hoverSince = now - 0.6
+  local screen = hs.mouse.getCurrentScreen():fullFrame()
+  local style = { font = ".AppleSystemUIFont", size = 13 }
+  local size = hs.drawing.getTextDrawingSize(lastTooltip, style)
+  local width = math.min(math.ceil(size.w) + 24, screen.w - 16)
+  local height = 16
+  for line in (lastTooltip .. "\n"):gmatch("(.-)\n") do
+    local lineSize = hs.drawing.getTextDrawingSize(line ~= "" and line or " ", style)
+    height = height + lineSize.h * math.max(1, math.ceil(lineSize.w / (width - 24)))
+  end
+  height = math.min(math.ceil(height), screen.h - 16)
+  tooltipCanvas = hs.canvas.new({
+    x = math.max(screen.x + 8, math.min(frame.x, screen.x + screen.w - width - 8)),
+    y = math.max(screen.y + 8, math.min(frame.y + frame.h + 6, screen.y + screen.h - height - 8)),
+    w = width, h = height,
+  })
+  if not tooltipCanvas then return end
+  tooltipCanvas:level("popUpMenu")
+  tooltipCanvas:behaviorAsLabels({ "canJoinAllSpaces", "fullScreenAuxiliary" })
+  tooltipCanvas:appendElements(
+    { type = "rectangle", action = "fill", fillColor = { white = 0.12, alpha = 0.96 },
+      roundedRectRadii = { xRadius = 7, yRadius = 7 } },
+    { type = "text", text = lastTooltip, textFont = ".AppleSystemUIFont", textSize = 13,
+      textColor = { white = 1 }, textLineBreak = "wordWrap",
+      frame = { x = 12, y = 8, w = width - 24, h = height - 16 } })
+  tooltipCanvas:show()
+  visibleTooltip = lastTooltip
+end
+
 local function setTooltip(text)
-  if text == lastTooltip then return end
   lastTooltip = text
-  menu:setTooltip(text)
 end
 
 render = function()
@@ -214,15 +266,13 @@ render = function()
     -- menubar space until the next title supplies its final dimensions.
     setPill("♪", nil, nil, nil, nil, nil, true)
   end
-  -- Tooltips have no padding control; fake margins with blank lines/leading spaces.
-  local PAD = "  "
   local lines = {}
-  if s.track then lines[#lines + 1] = PAD .. "🎵\u{2002}" .. s.track end
-  if s.artist then lines[#lines + 1] = PAD .. "👤\u{2002}" .. s.artist end
-  if s.sourceName then lines[#lines + 1] = PAD .. s.sourceName end
-  if ctxName then lines[#lines + 1] = PAD .. "💿\u{2002}" .. ctxName end
+  if s.track then lines[#lines + 1] = "🎵\u{2002}" .. s.track end
+  if s.artist then lines[#lines + 1] = "👤\u{2002}" .. s.artist end
+  if s.sourceName then lines[#lines + 1] = s.sourceName end
+  if ctxName then lines[#lines + 1] = "💿\u{2002}" .. ctxName end
   if #lines == 0 then setTooltip(api and api.appName or "Player") return end
-  setTooltip("\n" .. table.concat(lines, "\n\n") .. "\n")
+  setTooltip(table.concat(lines, "\n\n"))
 end
 
 local function copyCurrent(track, artist)
@@ -467,6 +517,9 @@ module.start = function(deps)
   pill = pillRenderer.new(menu, PILL_OPTS, { progressSteps = PILL_PROGRESS_STEPS })
   render()
   timer = hs.timer.doEvery(1, renderCurrent):start()
+  hoverTimer = hs.timer.doEvery(0.1, function()
+    if currentGeneration == generation and menu then updateTooltip() end
+  end)
   mouseDownWatcher = hs.eventtap.new({
     hs.eventtap.event.types.leftMouseDown,
     hs.eventtap.event.types.leftMouseUp,
@@ -474,6 +527,11 @@ module.start = function(deps)
     hs.eventtap.event.types.rightMouseDown,
   }, function(event)
     local etype = event:getType()
+    if etype == hs.eventtap.event.types.leftMouseDown
+      or etype == hs.eventtap.event.types.rightMouseDown then
+      hideTooltip()
+      hoverDismissed = true
+    end
     -- Own the entire gesture so native status-item mouse tracking cannot delay
     -- the hold timer until release. Always clean up on mouse-up, even outside
     -- the pill or if Command was pressed after mouse-down.
@@ -557,6 +615,9 @@ module.stop = function()
   for task in pairs(deferred) do task:stop() end
   deferred = {}
   if timer then timer:stop() end
+  if hoverTimer then hoverTimer:stop() end
+  hideTooltip()
+  hoverTimer, hoverDismissed = nil, false
   if pendingClick then pendingClick:stop() end
   cancelHold()
   if mouseDownWatcher then mouseDownWatcher:stop() end
