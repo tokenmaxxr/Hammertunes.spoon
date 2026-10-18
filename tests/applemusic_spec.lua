@@ -58,9 +58,9 @@ end)
 
 t.test("applemusic: mrState builds a streaming state (no trackId/artPath)", function()
   hs.timer._now = 0
-  local s = T.mrState({ title = "T", artist = "A", duration = 100, elapsed = 50, rate = 1 }, true, nil)
+  local s = T.mrState({ title = "T", artist = "A", album = "Album", duration = 100, elapsed = 50, rate = 1 }, true, nil)
   t.eq(s, {
-    running = true, playing = true, track = "T", artist = "A",
+    running = true, playing = true, track = "T", artist = "A", album = "Album",
     progress = 0.5, durMs = 100000, artUrl = nil, artPath = nil,
     trackId = nil, shuffle = true,
     canControl = false, canSeek = false, canLike = false, canAddToPlaylist = false,
@@ -292,6 +292,24 @@ local function withDelayedTasks(fn)
   resetStubs()
   if not ok then error(err, 0) end
 end
+
+t.test("applemusic: forced streaming read bypasses polling and rejects pending stale data", function()
+  withDelayedTasks(function(tasks)
+    t.eq(am.getState().track, "Song")
+    hs.timer._now = 1003
+    am.getState()
+    t.eq(#tasks, 1)
+    hs._exec = function()
+      return '{"title":"New","duration":100,"elapsed":75,"rate":1,"bundleId":"com.apple.Music"}'
+    end
+    local state = am.getState(true)
+    t.eq(state.track, "New")
+    t.eq(state.progress, 0.75)
+    t.eq(tasks[1].terminated, true)
+    tasks[1].callback(0, '{"title":"Old","bundleId":"com.apple.Music"}')
+    t.eq(T.mrSnapshot().title, "New")
+  end)
+end)
 
 t.test("applemusic: delayed MediaRemote reads obey interval and cancel stale transport results", function()
   withDelayedTasks(function(tasks, _, actions)
@@ -533,7 +551,7 @@ t.test("applemusic: getState library track with embedded art sets artPath, not a
         return true, "OK"
       end
       -- MUSIC_QUERY: library track with embedded art
-      return true, "OK\tplaying\tfalse\tMy Track\tMy Artist\t" .. trackId .. "\t200\t40\tfalse"
+      return true, "OK\tplaying\tfalse\tMy Track\tMy Artist\t" .. trackId .. "\t200\t40\tfalse\tMy Album"
     end
 
     local s = am.getState()
@@ -541,6 +559,7 @@ t.test("applemusic: getState library track with embedded art sets artPath, not a
     t.eq(s.playing, true)
     t.eq(s.track, "My Track")
     t.eq(s.artist, "My Artist")
+    t.eq(s.album, "My Album")
     t.eq(s.trackId, trackId)
     t.eq(s.artPath, expectedPath)
     t.eq(s.artUrl, nil)   -- embedded art found, no URL fallback needed
@@ -639,6 +658,10 @@ t.test("applemusic: getState throttles MUSIC_QUERY and interpolates between read
   hs.timer._now = 1004                       -- +4s from the read, past the interval
   am.getState()                              -- real read again
   t.eq(mqCalls, 2)
+  hs.timer._now = 1004.1
+  local forced = am.getState(true)
+  t.eq(mqCalls, 3)
+  t.eq(forced.progress, 0.1)
   resetStubs()
 end)
 

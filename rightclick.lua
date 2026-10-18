@@ -18,23 +18,28 @@ local module = {}
 
 local MENU_PLAYLIST_LIMIT = 25
 
--- This is also used by the controller to warm exactly the visible icons.
+-- Select only the entries visible in each playlist submenu.
 module.selectEntries = function(ctx)
   local api = ctx.api
   local playlists = api and api.getPlaylists() or {}
   local owned, play, seen = {}, {}, {}
   if api and ctx.trackId and ctx.canAddToPlaylist ~= false then
     for _, p in ipairs(playlists) do
-      if p.owned and #owned < MENU_PLAYLIST_LIMIT then owned[#owned + 1] = p end
+      if p.owned then
+        owned[#owned + 1] = p
+        if #owned == MENU_PLAYLIST_LIMIT then break end
+      end
     end
   end
   if ctx.running then
     local function add(entries)
+      if #play == MENU_PLAYLIST_LIMIT then return end
       for _, p in ipairs(entries) do
         local key = p.id or p.uri
-        if key and not seen[key] and #play < MENU_PLAYLIST_LIMIT then
+        if key and not seen[key] then
           seen[key] = true
           play[#play + 1] = p
+          if #play == MENU_PLAYLIST_LIMIT then break end
         end
       end
     end
@@ -241,7 +246,7 @@ local function playbackGroup(ctx, selection)
       playItems[#playItems + 1] = {
         title = r.name or r.uri,
         image = ctx.menuIcon(r.imageUrl),
-        fn = function(mods) api.playContext(ruri, playMode(mods)) end,
+        fn = function(mods) api.playContext(ruri, playMode(mods)); ctx.scheduleRender() end,
       }
     end
   end

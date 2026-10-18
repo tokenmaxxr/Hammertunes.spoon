@@ -298,6 +298,7 @@ local function mrState(mrData, shuffle, artUrl, source)
     playing  = (tonumber(mrData.rate) or 0) > 0,
     track    = (title ~= "" and title) or nil,
     artist   = artist,
+    album    = mrData.album ~= "" and mrData.album or nil,
     progress = progress,
     durMs    = durMs,
     artUrl   = artUrl,
@@ -376,7 +377,13 @@ local PLAYLISTS_SCRIPT = tellMusic([[
 -- getState() — the hot path, called at 1 Hz by pill.lua
 -- ---------------------------------------------------------------------------
 
-module.getState = function()
+module.getState = function(force)
+  if force then
+    invalidateAsSnapshot()
+    -- Re-probe streaming playback synchronously after a user action instead
+    -- of serving the old MediaRemote snapshot while an async read runs.
+    cachedPath = nil
+  end
   -- Fast path: is Music running at all? Use applicationsForBundleID, NOT
   -- hs.application.get("Music"): the by-name lookup costs ~27 ms/call (it scans
   -- every running app), and this runs on every 1 Hz tick — that alone was ~2%
@@ -405,8 +412,8 @@ module.getState = function()
 
       if result:sub(1, 2) == "OK" then
         -- Library track: full metadata available.
-        local _, state, shuffle, name, artist, dbId, durSec, posSec, favorited =
-          result:match("^([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t(.*)$")
+        local _, state, shuffle, name, artist, dbId, durSec, posSec, favorited, album =
+          result:match("^([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t?(.*)$")
         local durMs   = math.max(0, (tonumber(durSec) or 0) * 1000)
         local trackId = tonumber(dbId)
         local progress = prog.calcProgress(tonumber(posSec) or 0, durMs)
@@ -436,6 +443,7 @@ module.getState = function()
           playing  = state == "playing",
           track    = name ~= "" and name or nil,
           artist   = artist ~= "" and artist or nil,
+          album    = album ~= "" and album or nil,
           progress = progress,
           durMs    = durMs,
           artUrl   = artUrl,
@@ -652,7 +660,7 @@ local function setLiked(trackId, liked)
   if ok then
     if trackId == currentLikedTrackId then currentLiked = liked end
     asSnapshotAt = -math.huge
-    if onChange then onChange() end
+    if onChange then onChange(true) end
   end
 end
 module.like = function(trackId) setLiked(trackId, true) end

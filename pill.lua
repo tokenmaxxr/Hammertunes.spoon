@@ -18,26 +18,60 @@ local function merge(base, overrides)
   return out
 end
 
-module.image = function(text, opts)
-  opts = merge(DEFAULTS, opts)
-  local styled = hs.styledtext.new(text, { font = opts.font, color = opts.color })
-  local mainSize = hs.drawing.getTextDrawingSize(styled)
-  local mainW = math.ceil(mainSize.w)
-  local mainH = math.ceil(mainSize.h)
+local function styleKey(value)
+  if type(value) ~= "table" then return string.format("%q", tostring(value)) end
+  local fields = {}
+  for k, v in pairs(value) do fields[#fields + 1] = tostring(k) .. "=" .. styleKey(v) end
+  table.sort(fields)
+  return "{" .. table.concat(fields, ",") .. "}"
+end
 
-  local subStyled, subW, subH
-  if opts.subtitle and opts.subtitle ~= "" then
-    if type(opts.subtitle) == "string" then
-      local subFont = opts.subtitleFont or { name = opts.font.name, size = 9 }
-      local subColor = opts.subtitleColor or { white = 1, alpha = 0.8 }
-      subStyled = hs.styledtext.new(opts.subtitle, { font = subFont, color = subColor })
-    else
-      subStyled = opts.subtitle
+module.image = function(text, opts, layoutCache)
+  opts = merge(DEFAULTS, opts)
+  local layoutKey = layoutCache and styleKey({ text, opts.subtitle or "", opts.font, opts.color,
+    opts.subtitleFont or false, opts.subtitleColor or false,
+    opts.likedOverlay or false, opts.likedFontSize or 9, opts.likedColor or false })
+  local layout = layoutCache and layoutCache.key == layoutKey and layoutCache.layout
+  if not layout then
+    local styled = hs.styledtext.new(text, { font = opts.font, color = opts.color })
+    local mainSize = hs.drawing.getTextDrawingSize(styled)
+    local mainW = math.ceil(mainSize.w)
+    local mainH = math.ceil(mainSize.h)
+
+    local subStyled, subW, subH
+    if opts.subtitle and opts.subtitle ~= "" then
+      if type(opts.subtitle) == "string" then
+        local subFont = opts.subtitleFont or { name = opts.font.name, size = 9 }
+        local subColor = opts.subtitleColor or { white = 1, alpha = 0.8 }
+        subStyled = hs.styledtext.new(opts.subtitle, { font = subFont, color = subColor })
+      else
+        subStyled = opts.subtitle
+      end
+      local subSize = hs.drawing.getTextDrawingSize(subStyled)
+      subW = math.ceil(subSize.w)
+      subH = math.ceil(subSize.h)
     end
-    local subSize = hs.drawing.getTextDrawingSize(subStyled)
-    subW = math.ceil(subSize.w)
-    subH = math.ceil(subSize.h)
+
+    local heartStyled, heartW, heartH = nil, 0, 0
+    if opts.likedOverlay then
+      local heartSize = opts.likedFontSize or 9
+      local heartColor = opts.likedColor or { red = 0.07, green = 0.5, blue = 0.24 }
+      heartStyled = hs.styledtext.new("♥", {
+        font = { name = opts.font.name, size = heartSize },
+        color = heartColor,
+      })
+      local hSize = hs.drawing.getTextDrawingSize(heartStyled)
+      heartW = math.ceil(hSize.w)
+      heartH = math.ceil(hSize.h)
+    end
+    layout = { styled = styled, mainW = mainW, mainH = mainH,
+      subStyled = subStyled, subW = subW, subH = subH,
+      heartStyled = heartStyled, heartW = heartW, heartH = heartH }
+    if layoutCache then layoutCache.key, layoutCache.layout = layoutKey, layout end
   end
+  local styled, mainW, mainH = layout.styled, layout.mainW, layout.mainH
+  local subStyled, subW, subH = layout.subStyled, layout.subW, layout.subH
+  local heartStyled, heartW, heartH = layout.heartStyled, layout.heartW, layout.heartH
 
   local h = opts.height
   local leadingImage = opts.leadingImage
@@ -46,19 +80,6 @@ module.image = function(text, opts)
   local artGap = opts.artGap or 6
   -- The cover dimensions are known before its asynchronous download finishes.
   local leadingW = (leadingImage or opts.reserveLeadingImage) and (artSize + artGap) or 0
-
-  local heartStyled, heartW, heartH = nil, 0, 0
-  if opts.likedOverlay then
-    local heartSize = opts.likedFontSize or 9
-    local heartColor = opts.likedColor or { red = 0.07, green = 0.5, blue = 0.24 }
-    heartStyled = hs.styledtext.new("♥", {
-      font = { name = opts.font.name, size = heartSize },
-      color = heartColor,
-    })
-    local hSize = hs.drawing.getTextDrawingSize(heartStyled)
-    heartW = math.ceil(hSize.w)
-    heartH = math.ceil(hSize.h)
-  end
 
   local heartGap = heartStyled and (opts.likedGap or 4) or 0
   local subRowW = (subW or 0) + (heartStyled and (heartGap + heartW) or 0)
@@ -156,6 +177,7 @@ module.new = function(menu, baseOpts, opts)
   local progressSteps = opts.progressSteps or 100
   local lastKey = nil
   local lastWidth = nil
+  local layoutCache = {}
 
   local function update(text, renderOpts)
     renderOpts = renderOpts or {}
@@ -166,17 +188,17 @@ module.new = function(menu, baseOpts, opts)
       text, step, tostring(renderOpts.subtitle or ""), renderOpts.leadingImageKey or "",
       renderOpts.likedOverlay and "1" or "0",
       renderOpts.reserveLeadingImage and "1" or "0", renderOpts.holdWidth and "1" or "0")
-    if key == lastKey then return end
+    if key == lastKey and not renderOpts.force then return end
     lastKey = key
     local img, width = module.image(text, merge(baseOpts, {
-      progress = progressQ,
+      progress = renderOpts.force and progress or progressQ,
       subtitle = renderOpts.subtitle,
       leadingImage = renderOpts.leadingImage,
       reserveLeadingImage = renderOpts.reserveLeadingImage,
       width = renderOpts.holdWidth and lastWidth or nil,
       likedOverlay = renderOpts.likedOverlay,
       likedColor = renderOpts.likedColor,
-    }))
+    }), layoutCache)
     lastWidth = width
     menu:setIcon(img, false)
   end
@@ -184,6 +206,7 @@ module.new = function(menu, baseOpts, opts)
   local function reset()
     lastKey = nil
     lastWidth = nil
+    layoutCache = {}
   end
 
   return { update = update, reset = reset }

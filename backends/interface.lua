@@ -18,6 +18,7 @@ local module = {}
 ---@field playing boolean|nil
 ---@field track string|nil
 ---@field artist string|nil
+---@field album string|nil Album title, separate from playback context
 ---@field trackId string|nil Stable library/service identity, when available
 ---@field progress number|nil Fraction from 0 to 1
 ---@field durMs number|nil
@@ -38,8 +39,8 @@ local module = {}
 ---@field appName string macOS app name used by launchOrFocus ("Spotify", "Music")
 ---
 --- State / polling
----@field getState fun(): HammertunesState Now-playing snapshot; capability flags apply to the displayed source
----@field start fun(changeCallback: fun()) Begin polling; call changeCallback whenever state changes
+---@field getState fun(force?: boolean): HammertunesState Now-playing snapshot; force bypasses polling caches after user actions
+---@field start fun(changeCallback: fun(force?: boolean)) Begin polling; request a forced action refresh with changeCallback(true)
 ---@field stop fun() Tear down all timers and watchers
 ---@field refresh fun() Re-poll async caches (context name, liked state) immediately
 ---

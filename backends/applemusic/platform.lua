@@ -200,7 +200,11 @@ if application "Music" is running then
       set du to duration of t
       set pp to player position
       set fv to favorited of t as text
-      return "OK" & tab & s & tab & sh & tab & n & tab & ar & tab & di & tab & du & tab & pp & tab & fv
+      set al to ""
+      try
+        set al to album of t
+      end try
+      return "OK" & tab & s & tab & sh & tab & n & tab & ar & tab & di & tab & du & tab & pp & tab & fv & tab & al
     on error errMsg number errNum
       -- -1728: can't get object (streaming track not in library)
       -- Return the player state + shuffle so transport UI stays accurate.

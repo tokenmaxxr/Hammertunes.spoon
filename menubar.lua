@@ -55,6 +55,7 @@ local holdFired = false
 local leftPressed = false
 local gestureSnapshot = nil
 local gestureLocation = nil
+local gestureSequence = 0
 local lastSeekRatio = nil
 local lastSeekTime = 0
 local mouseDownWatcher = nil
@@ -82,8 +83,8 @@ local function defer(delay, callback)
   return task
 end
 
-local function sameTrack(snapshot)
-  local current = api and api.getState()
+local function sameTrack(snapshot, current)
+  current = current or (api and api.getState())
   return current and current.running and current.canControl ~= false
     and current.sourceBundleId == snapshot.sourceBundleId
     and current.trackId == snapshot.trackId and current.track == snapshot.track
@@ -145,23 +146,11 @@ local function ensureArt(artUrl, artPath)
   return nil
 end
 
--- Warm only the entries selected by the menu builder. Large libraries must not
--- continually evict the visible thumbnails by fetching hidden entries.
-local function prewarmMenuIcons()
-  if not api then return end
-  local ctx = {}
-  for k, v in pairs(lastState) do ctx[k] = v end
-  ctx.api = api
-  local selection = rightclick.selectEntries(ctx)
-  for _, entries in ipairs({ selection.owned, selection.play }) do
-    for _, p in ipairs(entries) do menuIcons.getUrl(p.imageUrl) end
-  end
-end
-
-local function setPill(text, progress, subtitle, artUrl, artPath, liked, holdWidth)
+local function setPill(text, progress, subtitle, artUrl, artPath, liked, holdWidth, force)
   local art = ensureArt(artUrl, artPath)
   local artKey = artUrl or artPath
   pill.update(text, {
+    force = force,
     progress = progress,
     subtitle = subtitle,
     leadingImage = art or nil,
@@ -230,9 +219,13 @@ local function setTooltip(text)
   lastTooltip = text
 end
 
-render = function()
+-- Keep gesture feedback local; the regular timer verifies at most once per
+-- second, and release forces a final read of the player's accepted position.
+local scrubState, scrubReadAt
+
+render = function(force, snapshot)
   if not menu or not pill then return end
-  local s = api and api.getState() or { running = false }
+  local s = snapshot or (api and api.getState(force)) or { running = false }
   lastState = s
   if api and s.track and (s.track ~= lastTrack or (s.playing and not lastPlaying)) then
     api.refresh()
@@ -247,11 +240,10 @@ render = function()
   lastPlaying = s.playing or false
   lastShuffle = s.shuffle or false
   lastRunning = s.running or false
-  prewarmMenuIcons()
   local ctxUri = api and api.getUri() or nil
   local ctxName = api and api.getName() or nil
   if not s.running or (hideContext and hideContext(ctxUri)) then
-    setPill("♪")
+    setPill("♪", nil, nil, nil, nil, nil, nil, force)
     setTooltip(api and (api.appName .. " not running") or "Not running")
     return
   end
@@ -260,17 +252,25 @@ render = function()
     local main = icon .. "\u{2002}" .. truncate(s.track, MAX_TRACK)
     local subtitle = s.artist and truncate(s.artist, MAX_ARTIST) or nil
     local liked = api and api.getLiked() == true
-    setPill(main, s.progress, subtitle, s.artUrl, s.artPath, liked)
+    setPill(main, s.progress, subtitle, s.artUrl, s.artPath, liked, nil, force)
   else
     -- Players can briefly report no track between songs. Keep the occupied
     -- menubar space until the next title supplies its final dimensions.
-    setPill("♪", nil, nil, nil, nil, nil, true)
+    setPill("♪", nil, nil, nil, nil, nil, true, force)
   end
   local lines = {}
   if s.track then lines[#lines + 1] = "🎵\u{2002}" .. s.track end
   if s.artist then lines[#lines + 1] = "👤\u{2002}" .. s.artist end
-  if s.sourceName then lines[#lines + 1] = s.sourceName end
-  if ctxName then lines[#lines + 1] = "💿\u{2002}" .. ctxName end
+  if s.album then lines[#lines + 1] = "💿\u{2002}" .. s.album end
+  local function isPlayerName(name)
+    return name == "Music" or name == "Spotify" or (api and name == api.appName)
+  end
+  if s.sourceName and not isPlayerName(s.sourceName) then
+    lines[#lines + 1] = s.sourceName
+  end
+  if ctxName and ctxName ~= s.album and ctxName ~= s.sourceName and not isPlayerName(ctxName) then
+    lines[#lines + 1] = "📋\u{2002}" .. ctxName
+  end
   if #lines == 0 then setTooltip(api and api.appName or "Player") return end
   setTooltip(table.concat(lines, "\n\n"))
 end
@@ -291,9 +291,26 @@ local function openOnYouTube(track, artist)
   hs.urlevent.openURL("https://www.youtube.com/results?search_query=" .. hs.http.encodeForQuery(query))
 end
 
--- State lags mutating commands; refresh shortly after they fire.
+-- Read immediately, then once more after the player has had time to settle.
+-- Coalesce action bursts so delayed verification cannot accumulate.
+local pendingActionRender
+local function queueSettledRender()
+  if pendingActionRender then
+    pendingActionRender:stop()
+    deferred[pendingActionRender] = nil
+  end
+  local task
+  task = defer(0.2, function()
+    if pendingActionRender ~= task then return end
+    pendingActionRender = nil
+    if not scrubState then render(true) end
+  end)
+  pendingActionRender = task
+end
+
 local function scheduleRender()
-  defer(0.2, render)
+  render(true)
+  queueSettledRender()
 end
 
 local function clearPending()
@@ -312,21 +329,29 @@ local function cancelHold()
   end
 end
 
-local function seekToMouse()
-  if lastState.canControl == false or lastState.canSeek == false then return end
-  if gestureSnapshot and not sameTrack(gestureSnapshot) then return end
+local function drawScrub()
+  local snapshot = {}
+  for k, v in pairs(scrubState) do snapshot[k] = v end
+  snapshot.progress = lastSeekRatio
+  snapshot.playing = true
+  render(true, snapshot)
+end
+
+local function seekTo(location, current, snapshot)
+  if not current or current.canSeek == false or not sameTrack(snapshot, current) then return end
   local frame = menuFrame()
-  if not frame or frame.w <= 0 or lastDurMs <= 0 then return end
+  local duration = current.durMs or 0
+  if not frame or frame.w <= 0 or duration <= 0 then return end
   -- Consumed drag events can precede the global cursor update. Use the
   -- position from the owned gesture, including moves before the hold fires.
-  if not gestureLocation then return end
-  local relX = gestureLocation.x - frame.x
+  if not location then return end
+  local relX = location.x - frame.x
   local ratio = math.max(0, math.min(1, relX / frame.w))
   if ratio == lastSeekRatio then return end
-  api.setPosition(ratio * (lastDurMs / 1000))
+  api.setPosition(ratio * (duration / 1000))
   lastSeekRatio = ratio
   lastSeekTime = hs.timer.secondsSinceEpoch()
-  scheduleRender()
+  return true
 end
 
 local function onLeftClick()
@@ -494,8 +519,19 @@ module.start = function(deps)
   api = deps.api
   local images = deps.images
   -- render is assigned at module load time, so it's safe to hand over directly.
-  local function renderCurrent()
-    if currentGeneration == generation then render() end
+  local function renderCurrent(force)
+    if currentGeneration ~= generation then return end
+    if scrubState then
+      local now = hs.timer.secondsSinceEpoch()
+      if now - scrubReadAt < 1 then return end
+      scrubState = api.getState(true)
+      scrubReadAt = now
+      render(true, scrubState)
+    elseif force == true then
+      scheduleRender()
+    else
+      render()
+    end
   end
   artCache = images.newCache(MAX_ART_CACHE, { onLoad = renderCurrent })
   menuIcons = images.newCache(MAX_MENU_ICON_CACHE, {
@@ -527,6 +563,9 @@ module.start = function(deps)
     hs.eventtap.event.types.rightMouseDown,
   }, function(event)
     local etype = event:getType()
+    if etype == hs.eventtap.event.types.leftMouseDown then
+      gestureSequence = gestureSequence + 1
+    end
     if etype == hs.eventtap.event.types.leftMouseDown
       or etype == hs.eventtap.event.types.rightMouseDown then
       hideTooltip()
@@ -539,10 +578,18 @@ module.start = function(deps)
       leftPressed = false
       cancelHold()
       if holdFired then
-        gestureLocation = event:location()
-        seekToMouse()
+        local snapshot, location, sequence = gestureSnapshot, event:location(), gestureSequence
         holdFired = false
-        scheduleRender()
+        scrubState, scrubReadAt = nil, nil
+        -- Streaming reads can block. Return from the event tap before checking
+        -- identity and the final accepted position; a newer press cancels this.
+        defer(0, function()
+          if sequence ~= gestureSequence then return end
+          local current = api.getState(true)
+          local changed = seekTo(location, current, snapshot)
+          render(true, changed and api.getState(true) or current)
+          if changed then queueSettledRender() end
+        end)
       else
         local frame = menuFrame()
         local loc = event:location()
@@ -560,7 +607,7 @@ module.start = function(deps)
     if etype == hs.eventtap.event.types.leftMouseDragged and leftPressed then
       gestureLocation = event:location()
       if holdFired and hs.timer.secondsSinceEpoch() - lastSeekTime >= SEEK_THROTTLE_SEC then
-        seekToMouse()
+        if seekTo(gestureLocation, scrubState, gestureSnapshot) then drawScrub() end
       end
       return true
     end
@@ -573,7 +620,7 @@ module.start = function(deps)
       local loc = event:location()
       if not hs.geometry(loc):inside(frame) then return false end
       -- Remember where along the pill the click landed so the menu can offer a
-      -- "Seek to <time>" jump to that position (same mapping as seekToMouse).
+      -- "Seek to <time>" jump to that position (same mapping as seekTo).
       local seekRatio = math.max(0, math.min(1, (loc.x - frame.x) / frame.w))
       -- Defer to next tick so we don't show UI from inside the eventtap callback.
       defer(0, function() showRightClickMenu(seekRatio) end)
@@ -588,6 +635,12 @@ module.start = function(deps)
       if not hs.geometry(event:location()):inside(frame) then return false end
       -- Inactive pill is menu-only: no hold-to-seek on a dead player.
       if not lastRunning then return false end
+      if menuOpen then
+        -- We consume this mouse-down, so native menu tracking cannot dismiss
+        -- the popup itself. Close it before continuing the pill gesture.
+        pendingSeekRatio = nil
+        hs.eventtap.keyStroke({}, "escape", 0)
+      end
       leftPressed = true
       gestureLocation = event:location()
       lastSeekRatio = nil
@@ -597,10 +650,13 @@ module.start = function(deps)
         holdTimer = nil
         holdFired = true
         clearPending()
-        if snapshot.canControl == false or snapshot.canSeek == false
-          or not sameTrack(snapshot) then return end
-        seekToMouse()
+        if snapshot.canControl == false or snapshot.canSeek == false then return end
+        local current = api.getState(true)
+        if not sameTrack(snapshot, current) then return end
+        scrubState, scrubReadAt = current, hs.timer.secondsSinceEpoch()
+        seekTo(gestureLocation, current, snapshot)
         api.play()
+        if lastSeekRatio then drawScrub() end
       end)
       return true
     end
@@ -624,10 +680,12 @@ module.stop = function()
   if menu then menu:delete() end
   if api then api.stop() end
   timer, pendingClick, mouseDownWatcher, menu, pill = nil, nil, nil, nil, nil
+  pendingActionRender = nil
   lastTooltip, lastTrack, lastArtist, lastTrackId = nil, nil, nil, nil
   lastDurMs, holdFired, lastSeekTime, lastPlaying = 0, false, 0, false
   leftPressed = false
   gestureSnapshot = nil
+  scrubState, scrubReadAt = nil, nil
   lastState = {}
   lastShuffle, lastRunning, menuOpen, pendingSeekRatio = false, false, false, nil
   if artCache then artCache.reset() end

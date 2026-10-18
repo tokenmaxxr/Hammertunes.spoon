@@ -36,13 +36,15 @@ local function withGestures(fn)
     timers[#timers + 1] = timer
     return timer
   end
-  local menu = {}
+  local menu = { dismissals = 0 }
   function menu:_frame() return { x = 100, y = 980, w = 100, h = 20 } end
   function menu:setTitle() end
   function menu:setTooltip() end
   function menu:setClickCallback(callback) self.click = callback end
   function menu:setMenu(items) self.items = items end
-  function menu:popupMenu() end
+  function menu:popupMenu()
+    if self.onPopup then self.onPopup() end
+  end
   function menu:delete() end
   hs = {
     logger = savedHs.logger,
@@ -83,6 +85,10 @@ local function withGestures(fn)
     },
     eventtap = {
       event = { types = types },
+      keyStroke = function(_, key)
+        t.eq(key, "escape")
+        menu.dismissals = menu.dismissals + 1
+      end,
       new = function(subscriptions, callback)
         watcher = { callback = callback, subscriptions = {} }
         for _, kind in ipairs(subscriptions) do watcher.subscriptions[kind] = true end
@@ -98,8 +104,10 @@ local function withGestures(fn)
   local state = { running = true, playing = true, track = "Song", artist = "Artist",
     trackId = "song", durMs = 200000, progress = 0.1 }
   local renderCount = 0
+  local stateReads = 0
   local lastPill
   local menuContext
+  local notify
   local ok, err = pcall(function()
     subject = t.loadModule("menubar.lua")
     local noop = function() end
@@ -115,15 +123,18 @@ local function withGestures(fn)
         selectEntries = function() return { owned = {}, play = {} } end },
       api = {
         appName = "Test player",
-        getState = function()
+        getState = function(force)
+          stateReads = stateReads + 1
+          state.forced = force
           local snapshot = {}
           for k, v in pairs(state) do snapshot[k] = v end
           return snapshot
         end,
         getPlaylists = noop, getRecentlyPlayed = noop, getUri = noop,
-        getName = noop, getLiked = noop, refresh = noop, refreshLiked = noop,
+        getName = function() return state.contextName end,
+        getLiked = noop, refresh = noop, refreshLiked = noop,
         refreshPlaylists = noop, refreshRecentlyPlayed = noop,
-        start = noop, stop = noop,
+        start = function(callback) notify = callback end, stop = noop,
         getPosition = function() return 10 end,
         setPosition = function(value) record("seek", value) end,
         play = function() record("play") end,
@@ -133,7 +144,10 @@ local function withGestures(fn)
       },
     })
     local harness = { calls = calls, stop = subject.stop, state = state,
+      menu = menu,
       renders = function() return renderCount end, timers = timers,
+      reads = function() return stateReads end,
+      notify = function(force) notify(force) end,
       pill = function() return lastPill end,
       menuContext = function() return menuContext end, tooltips = tooltips,
       move = function(x) mouse = { x = x, y = 10 } end }
@@ -173,6 +187,85 @@ local function withGestures(fn)
   hs = savedHs
   if not ok then error(err, 0) end
 end
+
+t.test("menubar: pill click dismisses the open menu and performs its transport action", function()
+  for _, action in ipairs({ { x = 110, expected = { "seek", 0 } },
+    { x = 150, expected = { "playpause" } }, { x = 190, expected = { "next" } } }) do
+    withGestures(function(h)
+      local opens = 0
+      h.menu.onPopup = function()
+        opens = opens + 1
+        t.eq(h.event("leftMouseDown", action.x), true)
+        t.eq(h.menu.dismissals, 1, "consumed pill click must dismiss the native popup")
+      end
+      h.event("rightMouseDown", 150)
+      h.advance(0)
+      t.eq(h.menu.items, nil, "popup cleanup detaches the menu")
+      h.event("leftMouseUp", action.x)
+      h.advance(0.26)
+      t.eq(h.calls, { action.expected })
+      t.eq(opens, 1, "left click must not reopen the popup")
+    end)
+  end
+end)
+
+t.test("menubar: dismissing a menu preserves hold-to-seek", function()
+  withGestures(function(h)
+    h.menu.onPopup = function() h.event("leftMouseDown", 175) end
+    h.event("rightMouseDown", 150)
+    h.advance(0)
+    t.eq(h.menu.dismissals, 1)
+    h.advance(1)
+    t.eq(h.calls, { { "seek", 150 }, { "play" } })
+    h.event("leftMouseUp", 175)
+    h.advance(0)
+    t.eq(#h.calls, 2)
+  end)
+end)
+
+t.test("menubar: tooltip omits player names but retains playlists and other sources", function()
+  for _, player in ipairs({ "Music", "Spotify" }) do
+    withGestures(function(h)
+      h.state.sourceName, h.state.contextName = player, player
+      h.notify()
+      h.advance(0.8)
+      local text = h.tooltips[#h.tooltips].text
+      t.eq(text, "🎵\u{2002}Song\n\n👤\u{2002}Artist")
+      h.state.contextName = "Favorites"
+      h.notify()
+      h.advance(0.1)
+      text = h.tooltips[#h.tooltips].text
+      t.ok(text:find("📋\u{2002}Favorites", 1, true))
+      t.eq(text:find(player, 1, true), nil)
+      h.state.sourceName, h.state.contextName = "Safari", nil
+      h.notify()
+      h.advance(0.1)
+      t.ok(h.tooltips[#h.tooltips].text:find("Safari", 1, true))
+    end)
+  end
+end)
+
+t.test("menubar: tooltip retains albums named after players and avoids repeating album context", function()
+  withGestures(function(h)
+    h.state.album, h.state.sourceName, h.state.contextName = "Music", "Music", "Music"
+    h.notify()
+    h.advance(0.8)
+    local text = h.tooltips[#h.tooltips].text
+    t.eq(text, "🎵\u{2002}Song\n\n👤\u{2002}Artist\n\n💿\u{2002}Music")
+    h.state.contextName = "Favorites"
+    h.notify()
+    h.advance(0.1)
+    text = h.tooltips[#h.tooltips].text
+    t.ok(text:find("💿\u{2002}Music", 1, true))
+    t.ok(text:find("📋\u{2002}Favorites", 1, true))
+    h.state.album, h.state.contextName = "Spotify", "Spotify"
+    h.notify()
+    h.advance(0.1)
+    text = h.tooltips[#h.tooltips].text
+    t.ok(text:find("💿\u{2002}Spotify", 1, true))
+    t.eq(text:find("📋", 1, true), nil)
+  end)
+end)
 
 t.test("menubar: hover shows full metadata and survives progress redraws", function()
   withGestures(function(h)
@@ -256,6 +349,45 @@ t.test("menubar: owned hold seeks to relative position and suppresses release cl
   end)
 end)
 
+t.test("menubar: actions refresh immediately and recheck settling player state", function()
+  withGestures(function(h)
+    h.event("rightMouseDown", 175)
+    h.advance(0)
+    local reads = h.reads()
+    h.menuContext().scheduleRender()
+    t.eq(h.reads(), reads + 1)
+    t.eq(h.state.forced, true)
+    h.state.track = "Settled song"
+    h.advance(0.19)
+    t.eq(h.reads(), reads + 1)
+    h.advance(0.02)
+    t.eq(h.reads(), reads + 2)
+    t.eq(h.state.forced, true)
+    t.ok(h.pill().text:find("Settled song", 1, true))
+  end)
+end)
+
+t.test("menubar: forced completion notifications coalesce the settling read", function()
+  withGestures(function(h)
+    local reads = h.reads()
+    h.notify(true)
+    t.eq(h.reads(), reads + 1)
+    local firstCheck = h.timers[#h.timers]
+    h.advance(0.1)
+    h.notify(true)
+    t.eq(h.reads(), reads + 2)
+    -- A cancelled callback may already have been dispatched by the run loop.
+    firstCheck.callback()
+    t.eq(h.reads(), reads + 2)
+    h.advance(0.11)
+    t.eq(h.reads(), reads + 2)
+    h.advance(0.1)
+    t.eq(h.reads(), reads + 3)
+    h.advance(0.3)
+    t.eq(h.reads(), reads + 3)
+  end)
+end)
+
 t.test("menubar: scrub refreshes before release without changing the regular timer", function()
   withGestures(function(h)
     local repeating = {}
@@ -265,11 +397,16 @@ t.test("menubar: scrub refreshes before release without changing the regular tim
     h.event("leftMouseDown", 150)
     h.advance(1)
     local before = h.renders()
+    t.eq(h.pill().opts.force, true)
+    t.eq(h.state.forced, true)
+    h.advance(0.21)
+    t.eq(h.renders(), before)
+    h.event("leftMouseDragged", 175)
+    t.eq(h.renders(), before + 1)
+    t.eq(h.pill().opts.force, true)
+    t.eq(h.state.forced, true)
     h.advance(0.21)
     t.eq(h.renders(), before + 1)
-    h.event("leftMouseDragged", 175)
-    h.advance(0.21)
-    t.eq(h.renders(), before + 2)
     for _, timer in ipairs(h.timers) do
       if timer.repeating then t.eq(timer.repeating, repeating[timer]) end
     end
@@ -295,6 +432,108 @@ t.test("menubar: drag seeks are throttled and clamped until release", function()
   end)
 end)
 
+t.test("menubar: scrub draws once per action without reading state on each drag", function()
+  withGestures(function(h)
+    h.advance(0.5)
+    h.event("leftMouseDown", 150)
+    h.advance(0.99)
+    local reads, renders = h.reads(), h.renders()
+    h.advance(0.01)
+    t.eq(h.reads(), reads + 1)
+    t.eq(h.renders(), renders + 1)
+    t.eq(h.pill().opts.progress, 0.5)
+    reads, renders = h.reads(), h.renders()
+    h.advance(0.11)
+    h.event("leftMouseDragged", 175)
+    t.eq(h.reads(), reads)
+    t.eq(h.renders(), renders + 1)
+    t.eq(h.pill().opts.progress, 0.75)
+    h.event("leftMouseUp", 180)
+    t.eq(h.reads(), reads)
+    h.advance(0)
+    t.eq(h.reads(), reads + 2)
+    t.eq(h.renders(), renders + 2)
+    t.eq(h.calls[#h.calls], { "seek", 160 })
+  end)
+end)
+
+t.test("menubar: release verifies identity before seeking a newly changed track", function()
+  withGestures(function(h)
+    h.event("leftMouseDown", 150)
+    h.advance(1)
+    h.state.trackId, h.state.track = "new", "New song"
+    local calls, reads, renders = #h.calls, h.reads(), h.renders()
+    h.event("leftMouseUp", 180)
+    t.eq(h.reads(), reads)
+    h.advance(0)
+    t.eq(#h.calls, calls)
+    t.eq(h.reads(), reads + 1)
+    t.eq(h.renders(), renders + 1)
+    t.ok(h.pill().text:find("New song", 1, true))
+  end)
+end)
+
+t.test("menubar: final release seek confirms delayed player progress", function()
+  withGestures(function(h)
+    h.event("leftMouseDown", 150)
+    h.advance(1)
+    local reads = h.reads()
+    h.event("leftMouseUp", 180)
+    h.advance(0)
+    t.eq(h.reads(), reads + 2)
+    t.eq(h.calls[#h.calls], { "seek", 160 })
+    t.eq(h.pill().opts.progress, 0.1)
+    h.state.progress = 0.8
+    h.advance(0.21)
+    t.eq(h.reads(), reads + 3)
+    t.eq(h.state.forced, true)
+    t.eq(h.pill().opts.progress, 0.8)
+  end)
+end)
+
+t.test("menubar: a newer press cancels deferred release verification", function()
+  withGestures(function(h)
+    h.event("leftMouseDown", 150)
+    h.advance(1)
+    local calls, reads = #h.calls, h.reads()
+    h.event("leftMouseUp", 180)
+    h.event("leftMouseDown", 160)
+    h.advance(0)
+    t.eq(h.reads(), reads)
+    t.eq(#h.calls, calls)
+  end)
+end)
+
+t.test("menubar: stopping cancels deferred release verification", function()
+  withGestures(function(h)
+    h.event("leftMouseDown", 150)
+    h.advance(1)
+    local calls, reads = #h.calls, h.reads()
+    h.event("leftMouseUp", 180)
+    h.stop()
+    -- Already-dispatched callbacks must also respect the stopped generation.
+    for _, timer in ipairs(h.timers) do timer.callback() end
+    t.eq(h.reads(), reads)
+    t.eq(#h.calls, calls)
+  end)
+end)
+
+t.test("menubar: periodic scrub verification cancels seeks after a track change", function()
+  withGestures(function(h)
+    h.event("leftMouseDown", 150)
+    h.advance(1)
+    local reads = h.reads()
+    h.state.trackId, h.state.track = "new", "New song"
+    h.advance(1)
+    t.eq(h.reads(), reads + 1)
+    local calls = #h.calls
+    h.event("leftMouseDragged", 175)
+    h.event("leftMouseUp", 180)
+    t.eq(#h.calls, calls)
+    t.eq(h.pill().text:find("New song", 1, true) ~= nil, true)
+  end)
+end)
+
 t.test("menubar: repeated scrubs use event positions and flush the final throttled move", function()
   withGestures(function(h)
     for _, startX in ipairs({ 125, 150 }) do
@@ -309,6 +548,7 @@ t.test("menubar: repeated scrubs use event positions and flush the final throttl
       h.event("leftMouseDragged", 180, nil, startX)
       t.eq(#h.calls, first + 2)
       h.event("leftMouseUp", 185, nil, startX)
+      h.advance(0)
       t.eq(h.calls[first + 3], { "seek", 170 })
       h.advance(0.3)
       t.eq(#h.calls, first + 3)

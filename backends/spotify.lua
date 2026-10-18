@@ -126,13 +126,26 @@ end
 -- value. Spotify rotates refresh tokens on every use; one missed save means
 -- the next reload reads the OLD (now-revoked) token and auth breaks.
 local function keychainSet(account, value)
-  -- Same (output, success, ...) binding as keychainGet - hs.execute's signature,
-  -- not a bug.
-  local out, ok = hs.execute("/usr/bin/security add-generic-password -U -s " ..
-    shellEsc(SERVICE) .. " -a " .. shellEsc(account) ..
-    " -w " .. shellEsc(value) .. " 2>&1")
+  -- security -i reads this command from stdin. Only its fixed invocation is
+  -- visible in process arguments; never pass credentials to hs.execute.
+  local input
+  if type(value) == "string" and not value:find("[%z\r\n]") then
+    local escaped = value:gsub("\\", "\\\\"):gsub('"', '\\"')
+    input = "add-generic-password -U -s " .. SERVICE .. " -a " .. account
+      .. ' -w "' .. escaped .. '"\n'
+  end
+  -- Apple's interactive command reader has a 4096-byte line buffer. Refuse
+  -- truncation rather than accidentally storing part of a rotated token.
+  local pipe = input and #input < 4095
+    and io.popen("/usr/bin/security -i >/dev/null 2>&1", "w") or nil
+  local ok
+  if pipe then
+    local wrote = pipe:write(input)
+    local closed = pipe:close()
+    ok = wrote and closed
+  end
   if not ok then
-    log.e("keychainSet failed for " .. account .. ": " .. tostring(out))
+    log.e("keychainSet failed for " .. account)
     hs.alert.show("Spotify keychain save failed (" .. account .. ")", 5)
     return false
   end
@@ -147,9 +160,11 @@ local function loadCreds()
 end
 
 local function saveClientId(v)
-  if keychainSet("client_id", v) then
+  local saved = keychainSet("client_id", v)
+  if saved then
     cachedClientId, credsLoaded = v, true
   end
+  return saved
 end
 
 -- If keychain write fails, still update in-memory cache: Spotify just rotated,
@@ -157,8 +172,9 @@ end
 -- will read the stale keychain value and require re-auth (loud log above will
 -- explain why).
 local function saveRefreshToken(v)
-  keychainSet("refresh_token", v)
+  local saved = keychainSet("refresh_token", v)
   cachedRefreshToken, credsLoaded = v, true
+  return saved
 end
 
 local function urandom(n)
@@ -179,8 +195,8 @@ local function pkceChallenge(verifier)
   return b64url(bytes)
 end
 
-local function notify()
-  if onChange then onChange() end
+local function notify(force)
+  if onChange then onChange(force) end
 end
 
 -- Coalesces concurrent callers of one async operation: the first join()
@@ -777,6 +793,7 @@ local function playContext(contextUri, mode)
           "https://api.spotify.com/v1/me/player/play", "PUT", body, hdrs,
           function(status, response)
             if status == 200 or status == 202 or status == 204 then
+              notify(true)
               if mode == "smart" then queueSmartTracks(contextUri) end
               return
             end
@@ -916,7 +933,7 @@ local function setLiked(trackId, liked, verb)
         end
         if request == likedRequest and trackId == currentTrackId and currentLiked ~= liked then
           currentLiked = liked
-          notify()
+          notify(true)
         end
       end
     )
@@ -929,8 +946,12 @@ if application "Spotify" is running then
   tell application "Spotify"
     set s to player state as text
     set sh to shuffling as text
+    set al to ""
     try
-      return s & tab & (name of current track) & tab & (artist of current track) & tab & (player position) & tab & (duration of current track) & tab & (artwork url of current track) & tab & (id of current track) & tab & sh
+      set al to album of current track
+    end try
+    try
+      return s & tab & (name of current track) & tab & (artist of current track) & tab & (player position) & tab & (duration of current track) & tab & (artwork url of current track) & tab & (id of current track) & tab & sh & tab & al
     on error
       return s & tab & tab & tab & "0" & tab & "0" & tab & tab & sh
     end try
@@ -943,8 +964,8 @@ end if
 -- Parse a non-empty SPOTIFY_QUERY result line into the backend state table.
 -- Pure (no hs.*), so it's unit-testable in isolation.
 local function parseSpotifyState(result)
-  local state, track, artist, pos, dur, artUrl, trackUri, shuffle =
-    result:match("^([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t(.*)$")
+  local state, track, artist, pos, dur, artUrl, trackUri, shuffle, album =
+    result:match("^([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t?(.*)$")
   local posSec = tonumber(pos) or 0
   local durMs = tonumber(dur) or 0
   local progress = prog.calcProgress(posSec, durMs)
@@ -957,6 +978,7 @@ local function parseSpotifyState(result)
     playing = state == "playing",
     track = track ~= "" and track or nil,
     artist = artist ~= "" and artist or nil,
+    album = album ~= "" and album or nil,
     progress = progress,
     durMs = durMs,
     artUrl = artUrl ~= "" and artUrl or nil,
@@ -993,7 +1015,7 @@ local stateSnapshotAt = 0   -- secondsSinceEpoch of that read (0 forces a re-rea
 -- immediately rather than after the current poll interval elapses.
 local function invalidateSnapshot() stateSnapshotAt = 0 end
 
-module.getState = function()
+module.getState = function(force)
   -- Skip the AppleScript entirely when Spotify isn't running. Every
   -- hs.osascript.applescript call recompiles the script AND triggers an XProtect
   -- malware scan (tens of ms each); at 1 Hz, 24/7, that was ~2% CPU even with
@@ -1007,7 +1029,7 @@ module.getState = function()
   -- Serve an interpolated snapshot between throttled reads.
   local now = hs.timer.secondsSinceEpoch()
   local elapsed = now - stateSnapshotAt
-  if stateSnapshot and elapsed < poll.get() then
+  if not force and stateSnapshot and elapsed < poll.get() then
     return prog.interpolate(stateSnapshot, elapsed)
   end
   local ok, result = hs.osascript.applescript(SPOTIFY_QUERY)
@@ -1190,11 +1212,16 @@ module.authenticate = function(clientId)
   if authExchangeTimer then authExchangeTimer:stop(); authExchangeTimer = nil end
   authServer = hs.httpserver.new(false, false)
   authServer:setName("spotify-auth")
+  authServer:setInterface("127.0.0.1")
   authServer:setPort(AUTH_PORT)
+  authServer:maxBodySize(0)
   local exchanged = false
-  authServer:setCallback(function(_method, path)
+  authServer:setCallback(function(method, path)
     if authorization ~= authorizationGeneration or exchanged then
       return "Authorization session expired.", 400, {}
+    end
+    if method ~= "GET" or path:match("^[^?]*") ~= "/callback" then
+      return "Not found.", 404, {}
     end
     local code = path:match("[?&]code=([^&]+)")
     local recvState = path:match("[?&]state=([^&]+)")
@@ -1237,12 +1264,16 @@ module.authenticate = function(clientId)
           currentUserId, playlistsCache, playlistsFetchedAt = nil, nil, 0
           recentlyPlayedCache, recentlyPlayedFetchedAt = nil, 0
           currentUri, currentName, currentTrackId, currentLiked = nil, nil, nil, nil
-          saveClientId(clientId)
-          saveRefreshToken(data.refresh_token)
+          local clientSaved = saveClientId(clientId)
+          local refreshSaved = saveRefreshToken(data.refresh_token)
           accessToken = data.access_token
           accessExpiry = hs.timer.secondsSinceEpoch() + (data.expires_in or 3600)
-          log.i("auth saved; granted scope=" .. tostring(data.scope))
-          hs.alert.show("Spotify auth saved")
+          log.i("auth connected; granted scope=" .. tostring(data.scope))
+          if clientSaved and refreshSaved then
+            hs.alert.show("Spotify auth saved")
+          else
+            hs.alert.show("Spotify connected; Keychain save failed - re-authenticate after reload", 5)
+          end
           if onChange then
             later(0.5, refresh)
             later(1.0, function() fetchPlaylists() end)

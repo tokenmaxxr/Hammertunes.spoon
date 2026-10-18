@@ -309,3 +309,31 @@ t.test("rightclick: selected playback entries deduplicate recents and library", 
   t.eq(selection.play[1].id, "same")
   t.eq(selection.play[2].id, "other")
 end)
+
+t.test("rightclick: selection stops reading once both menu limits are filled", function()
+  local playlists = {}
+  for i = 1, 25 do playlists[i] = { id = "p" .. i, owned = true } end
+  playlists[26] = setmetatable({}, { __index = function() error("read hidden playlist") end })
+  local selection = rightclick.selectEntries({ running = true, trackId = "track", api = {
+    getPlaylists = function() return playlists end,
+    getRecentlyPlayed = function() return {} end,
+  } })
+  t.eq(#selection.owned, 25)
+  t.eq(#selection.play, 25)
+  t.eq(selection.owned[25].id, "p25")
+  t.eq(selection.play[25].id, "p25")
+end)
+
+t.test("rightclick: full recents skip the library and preserve recent priority", function()
+  local recents = { { uri = "recent1" }, { uri = "recent1" }, {} }
+  for i = 2, 25 do recents[#recents + 1] = { id = "recent" .. i } end
+  local hidden = setmetatable({}, { __index = function() error("read hidden entry") end })
+  recents[#recents + 1] = hidden
+  local selection = rightclick.selectEntries({ running = true, api = {
+    getRecentlyPlayed = function() return recents end,
+    getPlaylists = function() return { hidden } end,
+  } })
+  t.eq(#selection.play, 25)
+  t.eq(selection.play[1].uri, "recent1")
+  t.eq(selection.play[25].id, "recent25")
+end)

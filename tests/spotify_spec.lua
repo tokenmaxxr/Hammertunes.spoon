@@ -1,13 +1,20 @@
 local t = require("helper")
 local spotify = t.loadModule("backends/spotify.lua")
 local parse = spotify._test.parseSpotifyState
+
+t.test("spotify: state includes the album independently of playback context", function()
+  local state = parse("playing\tSong\tArtist\t10\t100000\t\tspotify:track:X\ttrue\tMusic")
+  t.eq(state.album, "Music")
+  t.eq(state.shuffle, true)
+  t.eq(parse("playing\tSong\tArtist\t10\t100000\t\tspotify:track:X\tfalse\t").album, nil)
+end)
 local parseRetryAfter = spotify._test.parseRetryAfter
 local singleFlight = spotify._test.singleFlight
 
 -- Delayed network completions exercise real public backend operations. No
 -- credentials or playlist caches are read from the developer's machine.
 local function withNetwork(body)
-  local previous, open = hs, io.open
+  local previous, open, popen = hs, io.open, io.popen
   local requests, timers, writes = {}, {}, {}
   local fake = setmetatable({}, { __index = previous })
   fake.timer = {
@@ -18,13 +25,7 @@ local function withNetwork(body)
       return timer
     end,
   }
-  fake.execute = function(command)
-    if command:find("add%-generic%-password") then
-      writes[#writes + 1] = command
-      return "", true
-    end
-    return "credential", true
-  end
+  fake.execute = function() return "credential", true end
   fake.json = { decode = function(value) return value end, encode = function() return "{}" end }
   fake.alert = { show = function() end }
   fake.http = { encodeForQuery = function(value) return value end }
@@ -38,10 +39,27 @@ local function withNetwork(body)
     if path:find(".hammertunes-playlists.json", 1, true) then return nil end
     return open(path, ...)
   end
+  fake.keychainInvocations, fake.alerts = {}, {}
+  fake.alert.show = function(message) fake.alerts[#fake.alerts + 1] = message end
+  io.popen = function(command, mode)
+    fake.keychainInvocations[#fake.keychainInvocations + 1] = { command = command, mode = mode }
+    if fake.keychainOpenFails then return nil end
+    return {
+      write = function(_, input)
+        writes[#writes + 1] = input
+        if fake.keychainWriteFails then return nil end
+        return true
+      end,
+      close = function()
+        if fake.keychainCloseFails then return nil, "exit", 1 end
+        return true, "exit", 0
+      end,
+    }
+  end
   hs = fake
   local backend = t.loadModule("backends/spotify.lua")
   local ok, err = pcall(body, backend, requests, timers, writes, fake)
-  hs, io.open = previous, open
+  hs, io.open, io.popen = previous, open, popen
   if not ok then error(err, 2) end
 end
 
@@ -149,6 +167,8 @@ local function authHarness(fake)
     fake.httpserver = { new = function()
       local server = {
         setName = function() end, setPort = function() end, start = function() end,
+        setInterface = function(self, interface) self.interface = interface end,
+        maxBodySize = function(self, size) self.bodySize = size end,
         stop = function(self) self.stopped = true end,
         setCallback = function(self, cb) self.callback = cb end,
       }
@@ -158,7 +178,9 @@ local function authHarness(fake)
     return servers, function(backend)
       backend.authenticate("client")
       local server, state = servers[#servers], authUrl:match("&state=([^&]+)")
-      return function() return server.callback("GET", "/callback?code=code&state=" .. state) end
+      return function(method, path)
+        return server.callback(method or "GET", (path or "/callback") .. "?code=code&state=" .. state)
+      end
     end
 end
 
@@ -179,7 +201,7 @@ t.test("spotify: superseded refresh and authorization cannot replace new credent
     requests[3].callback(200, { access_token = "new", refresh_token = "new" })
     requests[1].callback(200, { access_token = "old", refresh_token = "old" })
     t.eq(#writes, before + 2)
-    t.ok(writes[#writes]:find("'new'", 1, true))
+    t.ok(writes[#writes]:find('"new"', 1, true))
     t.eq(servers[2].stopped, true)
   end)
 end)
@@ -197,6 +219,76 @@ t.test("spotify: authorization started before backend start accepts its redirect
     exchange.callback()
     requests[1].callback(200, { access_token = "new", refresh_token = "new" })
     t.eq(#writes, 2)
+  end)
+end)
+
+t.test("spotify: authorization listener accepts only loopback GET callback requests", function()
+  withNetwork(function(backend, requests, timers, _, fake)
+    local servers, begin = authHarness(fake)
+    local redirect = begin(backend)
+    t.eq(servers[1].interface, "127.0.0.1")
+    t.eq(servers[1].bodySize, 0)
+    local before = #timers
+    for _, request in ipairs({ { "POST", "/callback" }, { "GET", "/elsewhere" },
+      { "GET", "/callback/extra" } }) do
+      local _, status = redirect(request[1], request[2])
+      t.eq(status, 404)
+    end
+    local _, status = servers[1].callback("GET", "/callback?code=bad&state=bad")
+    t.eq(status, 400)
+    t.eq(#requests, 0)
+    t.eq(#timers, before, "invalid requests cannot start a token exchange")
+    _, status = redirect()
+    t.eq(status, 200)
+    t.eq(#timers, before + 1)
+  end)
+end)
+
+t.test("spotify: Keychain writes send quoted secrets through stdin only", function()
+  withNetwork(function(backend, requests, _, writes, fake)
+    local secret = [=[refresh'"\token% $() `test`]=]
+    backend.refresh()
+    requests[1].callback(200, { access_token = "access", refresh_token = secret })
+    t.eq(#fake.keychainInvocations, 1)
+    t.eq(fake.keychainInvocations[1].command, "/usr/bin/security -i >/dev/null 2>&1")
+    t.eq(fake.keychainInvocations[1].mode, "w")
+    t.eq(writes[1], [=[add-generic-password -U -s Hammertunes -a refresh_token -w "refresh'\"\\token% $() `test`"
+]=])
+  end)
+end)
+
+t.test("spotify: Keychain input rejects control characters and oversized commands", function()
+  for _, secret in ipairs({ "new\ncommand", "new\rcommand", "new\0command", string.rep("x", 4096) }) do
+    withNetwork(function(backend, requests, _, writes, fake)
+      backend.refresh()
+      requests[1].callback(200, { access_token = "access", refresh_token = secret })
+      t.eq(#writes, 0)
+      t.eq(#fake.keychainInvocations, 0)
+      t.ok(fake.alerts[1]:find("keychain save failed", 1, true))
+    end)
+  end
+end)
+
+t.test("spotify: Keychain pipe open write and exit failures are reported", function()
+  for _, failure in ipairs({ "keychainOpenFails", "keychainWriteFails", "keychainCloseFails" }) do
+    withNetwork(function(backend, requests, _, _, fake)
+      fake[failure] = true
+      backend.refresh()
+      requests[1].callback(200, { access_token = "access", refresh_token = "rotated" })
+      t.ok(fake.alerts[1]:find("keychain save failed", 1, true))
+    end)
+  end
+end)
+
+t.test("spotify: authorization does not claim failed Keychain writes were saved", function()
+  withNetwork(function(backend, requests, timers, _, fake)
+    fake.keychainCloseFails = true
+    local _, begin = authHarness(fake)
+    begin(backend)()
+    timers[#timers].callback()
+    requests[1].callback(200, { access_token = "access", refresh_token = "refresh" })
+    t.eq(fake.alerts[#fake.alerts],
+      "Spotify connected; Keychain save failed - re-authenticate after reload")
   end)
 end)
 
@@ -388,6 +480,10 @@ t.test("spotify: getState throttles the osascript read and interpolates between"
   hs.timer._now = 1004                    -- +4s from the read, past the interval
   spotify.getState()                      -- real read again
   t.eq(calls, 2)
+  hs.timer._now = 1004.1
+  local forced = spotify.getState(true)
+  t.eq(calls, 3)
+  t.eq(forced.progress, 0.1)
   hs.osascript._applescript = prev
   hs.application._running["Spotify"] = nil
 end)
