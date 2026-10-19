@@ -1015,6 +1015,25 @@ local stateSnapshotAt = 0   -- secondsSinceEpoch of that read (0 forces a re-rea
 -- immediately rather than after the current poll interval elapses.
 local function invalidateSnapshot() stateSnapshotAt = 0 end
 
+-- Compile errors (-2740 / -2741) can indicate that AppleScript can't resolve
+-- Spotify's terminology, including a stale dictionary after a Spotify update.
+-- hs.osascript.applescript returns the NSAppleScript error dict third.
+local function isCompileError(err)
+  if type(err) ~= "table" then return false end
+  local code = tonumber(err.OSAScriptErrorNumberKey)
+  return code == -2740 or code == -2741
+end
+
+-- Warn once until a query succeeds.
+local compileErrorWarned = false
+local function warnCompileError()
+  if compileErrorWarned then return end
+  compileErrorWarned = true
+  log.w("Spotify's AppleScript query failed to compile; try restarting Hammerspoon "
+    .. "(this can happen after a Spotify update)")
+  hs.alert.show("Hammertunes: restart Hammerspoon to reconnect to Spotify", 5)
+end
+
 module.getState = function(force)
   -- Skip the AppleScript entirely when Spotify isn't running. Every
   -- hs.osascript.applescript call recompiles the script AND triggers an XProtect
@@ -1032,11 +1051,13 @@ module.getState = function(force)
   if not force and stateSnapshot and elapsed < poll.get() then
     return prog.interpolate(stateSnapshot, elapsed)
   end
-  local ok, result = hs.osascript.applescript(SPOTIFY_QUERY)
+  local ok, result, err = hs.osascript.applescript(SPOTIFY_QUERY)
+  if not ok and isCompileError(err) then warnCompileError() end
   if not ok or type(result) ~= "string" or result == "" then
     stateSnapshot = nil
     return { running = false }
   end
+  compileErrorWarned = false
   stateSnapshot = parseSpotifyState(result)
   stateSnapshotAt = now
   return stateSnapshot
@@ -1070,6 +1091,7 @@ module._test = {
   parseRetryAfter = parseRetryAfter,
   singleFlight = singleFlight,
   interpolate = prog.interpolate,
+  isCompileError = isCompileError,
 }
 
 module.getName = function() return currentName end

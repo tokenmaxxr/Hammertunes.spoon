@@ -338,6 +338,13 @@ module.build = function(ctx)
   append(playbackGroup(ctx, selection))
   append(updateGroup(ctx))
   append(accountGroup(ctx))
+  append({
+    { title = "-" },
+    {
+      title = "Hammertunes on GitHub",
+      fn = function() hs.urlevent.openURL("https://github.com/tokenmaxxr/Hammertunes.spoon") end,
+    },
+  })
   return items
 end
 

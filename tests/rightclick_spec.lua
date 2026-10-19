@@ -16,14 +16,14 @@ local function titles(items)
   return out
 end
 
-t.test("rightclick: no api, not running -> open + switch, no dangling separators", function()
+t.test("rightclick: no api, not running -> open + switch + project, no dangling separators", function()
   local items = rightclick.build({ switchLabel = "Spotify", switchBackend = function() end })
-  t.eq(titles(items), { "Open Player", "-", "Switch to Spotify" })
+  t.eq(titles(items), { "Open Player", "-", "Switch to Spotify", "-", "Hammertunes on GitHub" })
 end)
 
 t.test("rightclick: no api but running -> playback group is just Shuffle", function()
   local items = rightclick.build({ running = true })
-  t.eq(titles(items), { "Open Player", "-", "Shuffle: Off" })
+  t.eq(titles(items), { "Open Player", "-", "Shuffle: Off", "-", "Hammertunes on GitHub" })
 end)
 
 -- Minimal fake backend: liked current track, no playlists yet, supports
@@ -62,12 +62,13 @@ t.test("rightclick: full state -> app / track / playback groups in order", funct
     "-", "Unlike", "Copy \u{201C}Song by Artist\u{201D}", "Open on YouTube",
     "-", "Shuffle: Off", "Play Liked Songs",
     "-", "Refresh interval",
+    "-", "Hammertunes on GitHub",
   })
 end)
 
-t.test("rightclick: not running -> only Open / Switch, no playback or account items", function()
+t.test("rightclick: not running -> Open / Switch / project, no playback or account items", function()
   -- Backend still has playlists + Play Liked Songs cached and supports re-auth,
-  -- but the player is closed: the menu must collapse to just Open / Switch.
+  -- but the player is closed: only Open / Switch / project remain.
   local api = fakeApi()
   api.getPlaylists = function() return { { id = "p1", name = "Chill", uri = "u1" } } end
   api.supportsReauth = true
@@ -80,7 +81,7 @@ t.test("rightclick: not running -> only Open / Switch, no playback or account it
     switchLabel = "Apple Music",
     switchBackend = function() end,
   })
-  t.eq(titles(items), { "Open Spotify", "-", "Switch to Apple Music" })
+  t.eq(titles(items), { "Open Spotify", "-", "Switch to Apple Music", "-", "Hammertunes on GitHub" })
 end)
 
 t.test("rightclick: supportsSourceToggle -> checkable 'Show Other Sources' after Shuffle", function()
@@ -126,6 +127,7 @@ t.test("rightclick: running + supportsReauth -> Re-authenticate above Switch", f
     "-", T.PREV_LABEL, T.playPauseLabel(false), T.NEXT_LABEL,
     "-", "Shuffle: Off", "Play Liked Songs",
     "-", "Re-authenticate", "Refresh interval", "Switch to Apple Music",
+    "-", "Hammertunes on GitHub",
   })
 end)
 
@@ -142,6 +144,7 @@ t.test("rightclick: no track -> track group (and its separator) is absent", func
     "-", T.PREV_LABEL, T.playPauseLabel(false), T.NEXT_LABEL,
     "-", "Shuffle: On", "Play Liked Songs",
     "-", "Refresh interval",
+    "-", "Hammertunes on GitHub",
   })
 end)
 
@@ -261,7 +264,8 @@ t.test("rightclick: foreign media keeps metadata and library commands without re
   })
   local names = titles(items)
   t.eq(names, { "Open Spotify", "-", "Copy “Song by Artist”", "Open on YouTube",
-    "-", "Play Liked Songs", "Play Playlist", "Show Other Sources", "-", "Refresh interval" })
+    "-", "Play Liked Songs", "Play Playlist", "Show Other Sources", "-", "Refresh interval",
+    "-", "Hammertunes on GitHub" })
   items[3].fn()
   t.eq(copied, true)
 end)

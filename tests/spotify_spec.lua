@@ -511,6 +511,34 @@ t.test("spotify: getState - osascript fails outright returns not-running", funct
   )
 end)
 
+t.test("spotify: isCompileError matches only AppleScript syntax errors", function()
+  local isCompileError = spotify._test.isCompileError
+  t.eq(isCompileError({ OSAScriptErrorNumberKey = "-2741" }), true)
+  t.eq(isCompileError({ OSAScriptErrorNumberKey = -2740 }), true)
+  t.eq(isCompileError({ OSAScriptErrorNumberKey = "-1728" }), false)
+  t.eq(isCompileError(nil), false)
+end)
+
+t.test("spotify: getState - compile error alerts once until a read succeeds", function()
+  local prevAlert = hs.alert
+  local alerts = 0
+  hs.alert = { show = function() alerts = alerts + 1 end }
+  local compileError = function(_)
+    return false, nil, { OSAScriptErrorNumberKey = "-2741" }
+  end
+  withApplescript(compileError, function()
+    t.eq(spotify.getState(), { running = false })
+    t.eq(spotify.getState(true), { running = false })
+  end)
+  t.eq(alerts, 1)
+  withApplescript(function(_)
+    return true, table.concat({ "paused", "T", "A", "0", "1000", "", "", "false" }, "\t")
+  end, function() spotify.getState() end)
+  withApplescript(compileError, function() spotify.getState() end)
+  hs.alert = prevAlert
+  t.eq(alerts, 2)
+end)
+
 t.test("spotify: getState - osascript ok but empty result returns not-running", function()
   -- The AppleScript returns "" when Spotify is not running (the else branch of
   -- SPOTIFY_QUERY). getState must treat ok+empty the same as outright failure.

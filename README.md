@@ -144,6 +144,13 @@ thumbnails.
 **Smart Shuffle** is display-only; change it in Spotify. Regular shuffle can
 be toggled from the pill.
 
+### If the pill disappears after a Spotify update
+
+After a Spotify update, a stale AppleScript dictionary can prevent the pill
+from showing Spotify. Hammertunes shows a one-time alert when it detects this
+problem. Try quitting and reopening Hammerspoon; **Reload Config** may not clear
+the cached dictionary.
+
 ## Apple Music (beta)
 
 Library tracks support artwork, favorite/unfavorite, and adding to playlists.
@@ -183,7 +190,8 @@ brew upgrade --cask hammertunes
 ```
 
 After upgrading, reload Hammerspoon via **menu bar > Reload Config** to load
-the new code.
+the new code. If Spotify is still missing from the pill, quit and reopen
+Hammerspoon (see [Spotify troubleshooting](#if-the-pill-disappears-after-a-spotify-update)).
 
 ```sh
 git -C ~/.hammerspoon/Spoons/Hammertunes.spoon pull
